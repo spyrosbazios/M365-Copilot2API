@@ -81,7 +81,7 @@ def get_config_from_browser():
         "  try { const d = JSON.parse(rtEntry[1]); rt = d.secret || d.value || JSON.stringify(d); }"
         "  catch(e) { rt = rtEntry[1]; }"
         "}"
-        "return '===== 请复制下面完整的一行 JSON =====\\n' + JSON.stringify({oid, tenant, refresh_token: rt}) + '\\n===== 复制结束 =====';"
+        "return '===== 请复制下面完整的一行 JSON =====\\n' + JSON.stringify({oid, tenant, refresh_token: rt});"
         "})()"
     )
     print(js_snippet)
@@ -94,8 +94,10 @@ def get_config_from_browser():
     print("【请复制从这里开始 ==================================】")
     print("=" * 60)
     print()
+    print("  提示: 只粘贴 JSON 部分（从 { 开始到 } 结束），不要带 === 标记")
+    print()
 
-    raw = input("【请把上面复制的 JSON 粘贴到这里 => ").strip()
+    raw = input("粘贴 => ").strip()
     if not raw:
         print("错误: 未输入任何内容")
         sys.exit(1)
