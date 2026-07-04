@@ -242,16 +242,19 @@ def main():
             print(f"模型: {args.model}{', 工具: ' + str(tools_count) if not args.no_tools else ''}")
             print("退出: Ctrl+C")
             message_history = []
-            session_id = None
+            conv_id = None
             try:
+                if not args.auto_delete:
+                    conv_id = api.create()
+                    if conv_id:
+                        print(f"对话 ID: {conv_id[:12]}... (多轮上下文已启用)")
+                    else:
+                        print("提示: 无法创建持久对话，多轮上下文可能不连续")
                 while True:
                     try:
                         text = input("\n> ")
                         if not text:
                             continue
-                        conv_id = api.create() if args.auto_delete else None
-                        if session_id is None:
-                            session_id = conv_id or True
                         try:
                             if args.no_tools:
                                 if stream:
@@ -260,7 +263,7 @@ def main():
                                                              enable_image_gen=enable_image_gen)
                                 else:
                                     result = await client.chat(text, tone, gpt_override, conversation_id=conv_id,
-                                                                enable_image_gen=enable_image_gen)
+                                                               enable_image_gen=enable_image_gen)
                                     if result:
                                         print(result)
                                 print()
@@ -271,7 +274,7 @@ def main():
                                 print(result)
                                 print()
                         finally:
-                            if conv_id:
+                            if conv_id and args.auto_delete:
                                 try: api.delete(conv_id)
                                 except: pass
                     except (KeyboardInterrupt, EOFError):

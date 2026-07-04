@@ -162,12 +162,13 @@ class M365Client:
 
     async def chat_conversation(self, messages, tone="Magic", gpt_override=None, conversation_id=None,
                                 enable_image_gen=False, extra_options=None):
+        result_text = ""
         async for chunk, is_final in self.chat_conversation_stream_gen(
             messages, tone, gpt_override, conversation_id,
             enable_image_gen=enable_image_gen, extra_options=extra_options):
             if not is_final:
-                pass
-        return clean_text(self._last_full_text), self._last_tool_calls, self._last_finish_reason
+                result_text += chunk
+        return clean_text(result_text), self._last_tool_calls, self._last_finish_reason
 
     async def chat_conversation_stream_gen(self, messages, tone="Magic", gpt_override=None, conversation_id=None,
                                           enable_image_gen=False, extra_options=None):
