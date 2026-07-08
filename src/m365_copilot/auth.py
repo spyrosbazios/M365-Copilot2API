@@ -49,7 +49,6 @@ class TokenManager:
         }).encode()
         req = urllib.request.Request(self._token_url, data=data)
         req.add_header('Content-Type', 'application/x-www-form-urlencoded')
-        req.add_header('Origin', 'https://m365.cloud.microsoft')
         req.add_header('User-Agent', 'Mozilla/5.0')
         try:
             with urllib.request.urlopen(req, context=ssl.create_default_context()) as resp:

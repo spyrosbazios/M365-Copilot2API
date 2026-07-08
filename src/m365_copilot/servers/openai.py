@@ -17,10 +17,6 @@ RT_FILE = os.path.join(BASE_DIR, "data", "tokens", "rt_90day.txt")
 CACHE_FILE = os.path.join(BASE_DIR, "data", "tokens", "token_cache.json")
 
 ANTHROPIC_MODEL_MAP = {
-    "gpt-5.5": "gpt5.5",
-    "gpt-5.4": "gpt5.4",
-    "gpt-5.3": "gpt5.3",
-    "gpt-5.2": "gpt5.2",
     "gpt-4o": "auto",
     "gpt-4": "auto",
 }

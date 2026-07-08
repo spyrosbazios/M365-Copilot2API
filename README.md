@@ -25,7 +25,7 @@
 
 M365 Copilot 的浏览器界面通过一个未公开的 SignalR WebSocket 与后端通信。本项目将这个 WebSocket 接口包装成标准的 HTTP API，让你能在终端或任何 OpenAI 兼容客户端中使用它。
 
-**已实现的**: 文本对话流式/非流式输出、多轮上下文、session 续传、GPT-5.x 全系列模型
+**已实现的**: 文本对话流式/非流式输出、多轮上下文、session 续传
 
  **未实现的**: 图像生成、文件上传、代码解释器 — WebSocket 端点存在但本项目未对接
 
@@ -64,8 +64,9 @@ m365-copilot-server --port 8000         # 启动 HTTP API 服务
 ## CLI 使用
 
 ```bash
-# 指定模型 (实际都是 GPT-5，只是传给后端的参数不同)
-m365-copilot --model gpt5.2 "写一个快速排序"
+# 指定语气 (实际都是 GPT-5，只是传给后端的 tone 参数不同)
+m365-copilot --model auto "写一个快速排序"      # 自动（默认）
+m365-copilot --model quick "写一个快速排序"     # 快速答复
 
 # 多轮交互模式
 m365-copilot -i
@@ -78,7 +79,7 @@ m365-copilot --model reasoning "999*999"  # 深度推理模式
 
 | 参数 | 说明 |
 |------|------|
-| `--model` | 传给后端的模型标识: `auto`/`quick`/`reasoning`/`gpt5.2`-`gpt5.5` |
+| `--model` | 语气: `auto`/`quick`/`reasoning` |
 | `--reasoning` | 同 `--model reasoning` |
 | `-i` | 交互模式，保留多轮上下文 |
 | `--no-stream` | 等待完整回复，而非逐字输出 |
@@ -150,7 +151,7 @@ $ m365-copilot "北京天气怎么样"   # 自动调用 get_weather
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | 文本对话 | ✅ 可用 | 流式/非流式，多轮，session 续传，自动上下文匹配 |
-| 模型切换 | ✅ 支持切换 | GPT-5.x 全系列独立路由 |
+| 语气切换 | ✅ 支持 | auto/quick/reasoning 三种语气 |
 | 多轮上下文（无 session_id）| ✅ 自动匹配 | 消息前缀哈希自动续传同一对话 |
 | 图像生成 | ❌ 未实现 | payload 存在但无响应解析 |
 | Token 计数 | ⚠️ 粗估 | 空格分词，非真实 BPE 计数 |
