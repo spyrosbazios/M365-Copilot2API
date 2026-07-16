@@ -1,4 +1,4 @@
-import json, uuid, datetime
+import json, os, uuid, datetime
 
 from .models import USER_OID, TENANT_ID
 
@@ -226,7 +226,8 @@ def _message_text(content):
 
 
 def build_conversation_payload(hex_sid, uuid_sid, messages, tone="Magic", gpt_override=None,
-                               enable_image_gen=False, enable_file_upload=False, extra_options=None):
+                               enable_image_gen=False, enable_file_upload=False, extra_options=None,
+                               enable_bing=None, is_start_of_session=False):
     inv_id = str(uuid.uuid4())
     if enable_image_gen and enable_file_upload:
         options = list(OPTIONS_SETS_FULL)
@@ -267,16 +268,32 @@ def build_conversation_payload(hex_sid, uuid_sid, messages, tone="Magic", gpt_ov
                 "messageType": "Chat", "experienceType": "Default",
                 "adaptiveCards": [], "clientPreferences": {},
             })
-        elif role == "assistant" and content:
-            m365_history.append({
-                "author": "bot", "text": content, "messageType": "Chat",
-            })
+        elif role == "assistant":
+            # Summarize tool_calls-only assistant turns
+            if not content and m.get("tool_calls"):
+                names = []
+                for tc in m.get("tool_calls") or []:
+                    fn = (tc or {}).get("function") or {}
+                    names.append(fn.get("name") or "tool")
+                content = f"[called: {', '.join(names)}]"
+            if content:
+                m365_history.append({
+                    "author": "bot", "text": content, "messageType": "Chat",
+                })
         elif role == "tool":
+            tool_name = m.get("name") or "tool"
+            # Truncate huge tool results so the payload stays small
+            if len(content) > 1500:
+                content = content[:1450] + "…[truncated]"
             m365_history.append({
                 "author": "user", "inputMethod": "Keyboard",
-                "text": f"[Tool result: {content}]",
+                "text": f"[Tool result {tool_name}: {content}]",
                 "messageType": "Chat", "adaptiveCards": [], "clientPreferences": {},
             })
+
+    if enable_bing is None:
+        enable_bing = os.environ.get("M365_ENABLE_BING", "0") == "1"
+    plugins = [{"Id": "BingWebSearch", "Source": "BuiltIn"}] if enable_bing else []
 
     p = {
         "type": 4, "invocationId": inv_id, "target": "chat",
@@ -294,8 +311,8 @@ def build_conversation_payload(hex_sid, uuid_sid, messages, tone="Magic", gpt_ov
             "spokenTextMode": "None", "options": {}, "extraExtensionParameters": {},
             "allowedMessageTypes": ALLOWED_MSG_TYPES,
             "sliceIds": [], "tone": tone,
-            "plugins": [{"Id": "BingWebSearch", "Source": "BuiltIn"}],
-            "isStartOfSession": False,
+            "plugins": plugins,
+            "isStartOfSession": bool(is_start_of_session),
             "isSbsSupported": True, "renderReferencesBehindEOS": True,
             "disconnectBehavior": "continue",
         }]

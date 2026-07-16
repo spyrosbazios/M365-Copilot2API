@@ -165,20 +165,26 @@ class M365Client:
         yield ("", True)
 
     async def chat_conversation(self, messages, tone="Magic", gpt_override=None, conversation_id=None,
-                                enable_image_gen=False, extra_options=None, hex_sid=None):
+                                enable_image_gen=False, extra_options=None, hex_sid=None,
+                                enable_bing=None):
         result_text = ""
         async for chunk, is_final in self.chat_conversation_stream_gen(
             messages, tone, gpt_override, conversation_id,
-            enable_image_gen=enable_image_gen, extra_options=extra_options, hex_sid=hex_sid):
+            enable_image_gen=enable_image_gen, extra_options=extra_options, hex_sid=hex_sid,
+            enable_bing=enable_bing):
             if not is_final:
                 result_text += chunk
         return clean_text(result_text), self._last_tool_calls, self._last_finish_reason
 
     async def chat_conversation_stream_gen(self, messages, tone="Magic", gpt_override=None, conversation_id=None,
-                                          enable_image_gen=False, extra_options=None, hex_sid=None):
+                                          enable_image_gen=False, extra_options=None, hex_sid=None,
+                                          enable_bing=None):
         ws, hex_sid, uuid_sid = await self._ensure_ws(conversation_id, hex_sid=hex_sid)
-        payload = build_conversation_payload(hex_sid, uuid_sid, messages, tone, gpt_override,
-                                             enable_image_gen=enable_image_gen, extra_options=extra_options)
+        payload = build_conversation_payload(
+            hex_sid, uuid_sid, messages, tone, gpt_override,
+            enable_image_gen=enable_image_gen, extra_options=extra_options,
+            enable_bing=enable_bing,
+        )
         await ws.send(payload + "\x1e")
 
         tool_calls = []
@@ -226,10 +232,12 @@ class M365Client:
                 elif mt == 3:
                     self._last_tool_calls = tool_calls
                     self._last_finish_reason = "tool_calls" if tool_calls else "stop"
-                    self._mark_dirty()
+                    # Keep WS warm for subsequent turns in the same process.
+                    # Only invalidate on errors/timeouts.
                     yield ("", True)
                     return
                 elif mt == -1:
+                    self._invalidate_ws()
                     raise RuntimeError(str(data)[:200])
 
     async def _send_recv(self, ws, payload):

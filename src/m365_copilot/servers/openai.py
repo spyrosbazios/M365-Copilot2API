@@ -5,9 +5,10 @@ from .. import __version__
 from ..auth import TokenManager
 from ..client import _clean_citations, M365Client
 from ..models import MODELS, lookup_model, TENANT_ID, USER_OID, CLIENT_ID, SCOPE
-from ..tools import provider, ToolCallDetector
+from ..tools import provider
 from ..tools.mcp_bridge import MCPBridge
 from ..scripts.plugin_loader import load_user_tools
+from .. import agent_optimize as ao
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 load_user_tools()
@@ -57,88 +58,16 @@ def sse_done(chunk_id=None, model="gpt-4", usage=None, reasoning=None, finish_re
     return out
 
 
-def inject_tools_prompt(messages, tools):
-    tools_json = []
-    for t in tools:
-        fn = t.get("function", t)
-        tools_json.append({
-            "name": fn.get("name", "unknown"),
-            "description": fn.get("description", ""),
-            "parameters": fn.get("parameters", {}),
-        })
-    prompt = (
-        "Available helpers (optional). Use one when it clearly helps.\n"
-        f"{json.dumps(tools_json, ensure_ascii=False)}\n\n"
-        "When using a helper, reply with exactly one JSON object only, like:\n"
-        '{"name": "helper_name", "arguments": {"key": "value"}}\n'
-        "No markdown. No extra commentary around that JSON.\n"
-        "Otherwise answer in normal plain text.\n\n"
-    )
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            content = m.get("content", "")
-            if isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        part["text"] = prompt + (part.get("text") or "")
-                        break
-                else:
-                    content.insert(0, {"type": "text", "text": prompt})
-            else:
-                m["content"] = prompt + (content or "")
-            break
+def inject_tools_prompt(messages, tools, tool_choice=None):
+    ao.inject_tools_prompt(messages, tools, tool_choice=tool_choice)
 
 
-def _allowed_tool_names(tools):
-    names = set()
-    for t in tools or []:
-        fn = t.get("function", t) if isinstance(t, dict) else None
-        if isinstance(fn, dict) and fn.get("name"):
-            names.add(fn["name"])
-    return names
-
-
-def _args_to_json_str(args):
-    if args is None:
-        return "{}"
-    if isinstance(args, str):
-        try:
-            json.loads(args)
-            return args
-        except json.JSONDecodeError:
-            return json.dumps({"raw": args}, ensure_ascii=False)
-    return json.dumps(args, ensure_ascii=False)
-
-
-def _detect_text_tool_calls(text, tools=None):
-    """Parse prompt-injected tool JSON into OpenAI tool_calls."""
-    if not text or not str(text).strip():
-        return []
-    detected = ToolCallDetector.detect(str(text))
-    if not detected:
-        return []
-    name, args = detected
-    if not name:
-        return []
-    allowed = _allowed_tool_names(tools)
-    if allowed and name not in allowed:
-        return []
-    return [{
-        "id": f"call_{uuid.uuid4().hex}",
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": _args_to_json_str(args),
-        },
-    }]
-
-
-def _merge_tool_calls(native_tool_calls, text, tools=None):
+def _merge_tool_calls(native_tool_calls, text, tools=None, alias_to_real=None):
     """Prefer native M365 tool events; fall back to text JSON detection."""
     if native_tool_calls:
         return list(native_tool_calls), "tool_calls"
-    if tools:
-        parsed = _detect_text_tool_calls(text, tools)
+    if tools is not None:
+        parsed = ao.detect_tool_calls(text, tools=tools, alias_to_real=alias_to_real)
         if parsed:
             return parsed, "tool_calls"
     return [], "stop"
@@ -152,6 +81,17 @@ def _usage_from(messages, text):
         "completion_tokens": len(completion),
         "total_tokens": len(prompt_str.split()) + len(completion),
     }
+
+
+# Lightweight request metrics for /health
+_METRICS = {
+    "requests": 0,
+    "tool_calls": 0,
+    "refusals": 0,
+    "retries": 0,
+    "errors": 0,
+    "last_latency_ms": 0,
+}
 
 
 def inject_json_mode(messages):
@@ -181,9 +121,10 @@ def fim_to_chat(prompt, suffix=None):
 
 _loop = None
 _tm = None
-_client = None
+_clients = {}  # session_key -> M365Client (warm WS per session)
 _mcp = None
-_client_lock = threading.Lock()
+_client_lock = threading.RLock()
+_DEFAULT_CLIENT_KEY = "__default__"
 
 
 def _get_loop():
@@ -193,12 +134,32 @@ def _get_loop():
     return _loop
 
 
-def _get_client():
-    global _tm, _client
-    if _client is None:
+def _get_token_manager():
+    global _tm
+    if _tm is None:
         _tm = TokenManager(TENANT_ID, CLIENT_ID, SCOPE, RT_FILE, CACHE_FILE)
-        _client = M365Client(_tm)
-    return _client
+    return _tm
+
+
+def _get_client(session_key=None):
+    """Return a per-session client so WS can stay warm across turns."""
+    key = session_key or _DEFAULT_CLIENT_KEY
+    with _client_lock:
+        client = _clients.get(key)
+        if client is None:
+            client = M365Client(_get_token_manager())
+            _clients[key] = client
+            # Bound growth
+            if len(_clients) > 32:
+                oldest = next(iter(_clients))
+                if oldest != key:
+                    old = _clients.pop(oldest, None)
+                    if old:
+                        try:
+                            _run_async(old.close())
+                        except Exception:
+                            pass
+        return client
 
 
 def _run_async(coro):
@@ -253,23 +214,27 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         messages = req.get("messages", [])
         stream = bool(req.get("stream", False))
         tools = req.get("tools", None)
+        tool_choice = req.get("tool_choice", None)
         response_format = req.get("response_format", None) or {}
 
         cfg = lookup_model(model)
         if not cfg:
             return self._send_error(400, f"Unknown model: {model}")
-        return model, messages, stream, tools, response_format, cfg
+        return model, messages, stream, tools, tool_choice, response_format, cfg
 
     # ---- HTTP routing ----
     def do_GET(self):
         if self.path == "/v1/models":
             models = [{"id": v["openai_id"], "object": "model", "created": 1700000000, "owned_by": "microsoft"} for v in MODELS.values()]
             self._send_json(200, {"object": "list", "data": models})
-        elif self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
+        elif self.path in ("/health", "/v1/health"):
+            self._send_json(200, {
+                "status": "ok",
+                "version": __version__,
+                "metrics": dict(_METRICS),
+                "sessions": len(_clients),
+                "bing": ao.ENABLE_BING,
+            })
         else:
             self._send_error(404, "Not found")
 
@@ -304,22 +269,42 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         parsed = self._parse_params(req)
         if parsed is None:
             return
-        model, messages, stream, tools, response_format, cfg = parsed
+        model, messages, stream, tools, tool_choice, response_format, cfg = parsed
+        t0 = time.time()
+        _METRICS["requests"] += 1
 
         if response_format.get("type") == "json_object":
             inject_json_mode(messages)
 
-        if tools:
-            inject_tools_prompt(messages, tools)
+        # Compress history, alias/slim tools, inject compact tool prompt
+        prepared, aliased_tools, alias_to_real, meta = ao.prepare_chat_request(
+            messages, tools, tool_choice=tool_choice
+        )
+        logging.info(
+            "chat prepare model=%s msgs=%s tools=%s system_chars=%s",
+            model, meta.get("message_count"), meta.get("tool_count"), meta.get("system_chars"),
+        )
 
         conv_id = self._get_conv_id(req)
-        client = _get_client()
+        session_key = (
+            req.get("session_id")
+            or self.headers.get("X-Session-Id")
+            or req.get("user")
+            or _DEFAULT_CLIENT_KEY
+        )
+        client = _get_client(session_key)
 
         with _client_lock:
             if stream:
-                self._stream_chat(messages, cfg, client, conv_id, tools=tools)
+                self._stream_chat(
+                    prepared, cfg, client, conv_id,
+                    tools=aliased_tools, alias_to_real=alias_to_real, t0=t0,
+                )
             else:
-                self._non_stream_chat(messages, cfg, client, conv_id, tools=tools)
+                self._non_stream_chat(
+                    prepared, cfg, client, conv_id,
+                    tools=aliased_tools, alias_to_real=alias_to_real, t0=t0,
+                )
 
     def _write_sse(self, data):
         try:
@@ -343,7 +328,22 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                 }]
             }, chunk_id, openai_model))
 
-    def _stream_chat(self, messages, cfg, client, conv_id=None, tools=None):
+    async def _collect_completion(self, client, messages, tone, gpt_override, conv_id):
+        full_text = ""
+        async for chunk, is_final in client.chat_conversation_stream_gen(
+            messages, tone, gpt_override, conversation_id=conv_id,
+            enable_bing=ao.ENABLE_BING,
+        ):
+            if is_final:
+                break
+            chunk = _clean_citations(chunk)
+            if chunk:
+                full_text += chunk
+                yield chunk, full_text, False
+        yield "", full_text, True
+
+    def _stream_chat(self, messages, cfg, client, conv_id=None, tools=None,
+                     alias_to_real=None, t0=None):
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -355,53 +355,127 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         openai_model = cfg["openai_id"]
         tone = cfg["tone"]
         gpt_override = cfg["override"]
-        # Buffer when tools are present so tool JSON is not shown as chat text.
-        buffer_for_tools = bool(tools)
+        has_tools = bool(tools)
 
         try:
             async def stream_loop():
                 has_content = False
                 full_text = ""
+                buffered = ""
+                buffering = has_tools  # speculative buffer; may flip to live stream
+
                 async for chunk, is_final in client.chat_conversation_stream_gen(
-                    messages, tone, gpt_override, conversation_id=conv_id):
+                    messages, tone, gpt_override, conversation_id=conv_id,
+                    enable_bing=ao.ENABLE_BING,
+                ):
                     if is_final:
                         break
                     chunk = _clean_citations(chunk)
                     if not chunk:
                         continue
                     full_text += chunk
-                    if buffer_for_tools:
+
+                    if buffering:
+                        buffered += chunk
+                        # If it clearly is not tool JSON, flush and go live
+                        if len(buffered) > 24 and not ao.looks_like_tool_json(buffered):
+                            if not has_content:
+                                self._write_sse(sse_msg(
+                                    {"role": "assistant", "content": buffered},
+                                    chunk_id, openai_model,
+                                ))
+                                has_content = True
+                            else:
+                                self._write_sse(sse_msg(
+                                    {"content": buffered}, chunk_id, openai_model,
+                                ))
+                            buffered = ""
+                            buffering = False
                         continue
+
                     if not has_content:
-                        self._write_sse(sse_msg({"role": "assistant", "content": chunk}, chunk_id, openai_model))
+                        self._write_sse(sse_msg(
+                            {"role": "assistant", "content": chunk}, chunk_id, openai_model,
+                        ))
                         has_content = True
                     else:
                         self._write_sse(sse_msg({"content": chunk}, chunk_id, openai_model))
 
+                # Refusal auto-retry once with softer prompt
+                if (
+                    ao.REFUSAL_RETRY
+                    and ao.is_refusal(full_text)
+                    and not client._last_tool_calls
+                ):
+                    _METRICS["refusals"] += 1
+                    _METRICS["retries"] += 1
+                    logging.info("Refusal detected; retrying with softer prompt")
+                    retry_msgs = ao.refusal_retry_messages(messages)
+                    full_text = ""
+                    buffered = ""
+                    has_content = False
+                    buffering = has_tools
+                    async for chunk, is_final in client.chat_conversation_stream_gen(
+                        retry_msgs, tone, gpt_override, conversation_id=conv_id,
+                        enable_bing=ao.ENABLE_BING,
+                    ):
+                        if is_final:
+                            break
+                        chunk = _clean_citations(chunk)
+                        if not chunk:
+                            continue
+                        full_text += chunk
+                        if buffering:
+                            buffered += chunk
+                            continue
+                        if not has_content:
+                            self._write_sse(sse_msg(
+                                {"role": "assistant", "content": chunk},
+                                chunk_id, openai_model,
+                            ))
+                            has_content = True
+                        else:
+                            self._write_sse(sse_msg({"content": chunk}, chunk_id, openai_model))
+
                 tool_calls, finish_reason = _merge_tool_calls(
-                    client._last_tool_calls, full_text, tools=tools
+                    client._last_tool_calls, full_text,
+                    tools=tools, alias_to_real=alias_to_real,
                 )
                 usage = _usage_from(messages, full_text)
 
                 if tool_calls:
+                    _METRICS["tool_calls"] += 1
                     logging.info(
                         "Emitting tool_calls: %s",
                         [tc["function"]["name"] for tc in tool_calls],
                     )
                     self._emit_tool_call_chunks(tool_calls, chunk_id, openai_model)
-                    self._write_sse(sse_done(chunk_id, openai_model, usage, finish_reason="tool_calls"))
+                    self._write_sse(sse_done(
+                        chunk_id, openai_model, usage, finish_reason="tool_calls",
+                    ))
                     return
 
-                if buffer_for_tools and full_text:
-                    self._write_sse(sse_msg({"role": "assistant", "content": full_text}, chunk_id, openai_model))
+                # Flush buffered non-tool text
+                if buffering and full_text and not has_content:
+                    self._write_sse(sse_msg(
+                        {"role": "assistant", "content": full_text},
+                        chunk_id, openai_model,
+                    ))
+                    has_content = True
                 elif not has_content and not full_text:
-                    # empty completion
-                    self._write_sse(sse_msg({"role": "assistant", "content": ""}, chunk_id, openai_model))
+                    self._write_sse(sse_msg(
+                        {"role": "assistant", "content": ""}, chunk_id, openai_model,
+                    ))
 
-                self._write_sse(sse_done(chunk_id, openai_model, usage, finish_reason=finish_reason))
+                self._write_sse(sse_done(
+                    chunk_id, openai_model, usage, finish_reason=finish_reason,
+                ))
 
             _run_async(stream_loop())
+            if t0 is not None:
+                _METRICS["last_latency_ms"] = int((time.time() - t0) * 1000)
         except Exception as e:
+            _METRICS["errors"] += 1
             logging.exception("stream chat failed")
             err = {"id": chunk_id, "object": "chat.completion.chunk",
                    "created": int(time.time()), "model": openai_model,
@@ -409,25 +483,43 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
             self._write_sse(f"data: {json.dumps(err)}\n\n")
             self._write_sse("data: [DONE]\n\n")
 
-    def _non_stream_chat(self, messages, cfg, client, conv_id=None, tools=None):
+    def _non_stream_chat(self, messages, cfg, client, conv_id=None, tools=None,
+                         alias_to_real=None, t0=None):
         openai_model = cfg["openai_id"]
         tone = cfg["tone"]
         gpt_override = cfg["override"]
 
         try:
             result_text, native_tool_calls, finish_reason = _run_async(
-                client.chat_conversation(messages, tone, gpt_override, conversation_id=conv_id)
+                client.chat_conversation(
+                    messages, tone, gpt_override, conversation_id=conv_id,
+                    enable_bing=ao.ENABLE_BING,
+                )
             )
+            if ao.REFUSAL_RETRY and ao.is_refusal(result_text) and not native_tool_calls:
+                _METRICS["refusals"] += 1
+                _METRICS["retries"] += 1
+                logging.info("Refusal detected; retrying with softer prompt")
+                retry_msgs = ao.refusal_retry_messages(messages)
+                result_text, native_tool_calls, finish_reason = _run_async(
+                    client.chat_conversation(
+                        retry_msgs, tone, gpt_override, conversation_id=conv_id,
+                        enable_bing=ao.ENABLE_BING,
+                    )
+                )
         except Exception as e:
+            _METRICS["errors"] += 1
             self._send_error(500, str(e))
             return
 
         tool_calls, finish_reason = _merge_tool_calls(
-            native_tool_calls, result_text, tools=tools
+            native_tool_calls, result_text,
+            tools=tools, alias_to_real=alias_to_real,
         )
 
         msg = {"role": "assistant", "content": result_text if result_text else None}
         if tool_calls:
+            _METRICS["tool_calls"] += 1
             msg["tool_calls"] = tool_calls
             msg["content"] = None
             logging.info(
@@ -436,6 +528,9 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
             )
         elif not result_text:
             msg["content"] = None
+
+        if t0 is not None:
+            _METRICS["last_latency_ms"] = int((time.time() - t0) * 1000)
 
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",

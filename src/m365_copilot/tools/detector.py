@@ -1,5 +1,5 @@
 import re, json
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 
 def _extract_json_objects(text: str):
@@ -103,60 +103,84 @@ class ToolCallDetector:
         return None, None
 
     @staticmethod
-    def _from_parsed(data) -> Optional[Tuple[str, Dict]]:
+    def _collect_from_parsed(data, out: List[Tuple[str, Dict]]) -> None:
         if isinstance(data, list):
             for item in data:
-                found = ToolCallDetector._from_parsed(item)
-                if found:
-                    return found
-            return None
+                ToolCallDetector._collect_from_parsed(item, out)
+            return
         if not isinstance(data, dict):
-            return None
-        # OpenAI-ish: {"tool_calls":[{"function":{...}}]}
+            return
         if isinstance(data.get("tool_calls"), list):
             for tc in data["tool_calls"]:
-                found = ToolCallDetector._from_parsed(tc)
-                if found:
-                    return found
+                ToolCallDetector._collect_from_parsed(tc, out)
+            return
+        # Array-style wrapper: {"tools":[...]} / {"calls":[...]}
+        for key in ("tools", "calls", "functions"):
+            if isinstance(data.get(key), list):
+                for item in data[key]:
+                    ToolCallDetector._collect_from_parsed(item, out)
+                return
         name, args = ToolCallDetector._extract_name_and_args(data)
         if name:
-            return name, ToolCallDetector._normalize_args(args)
-        return None
+            out.append((name, ToolCallDetector._normalize_args(args)))
 
     @staticmethod
-    def detect(text: str) -> Optional[Tuple[str, Dict]]:
+    def _from_parsed(data) -> Optional[Tuple[str, Dict]]:
+        found: List[Tuple[str, Dict]] = []
+        ToolCallDetector._collect_from_parsed(data, found)
+        return found[0] if found else None
+
+    @staticmethod
+    def detect_all(text: str) -> List[Tuple[str, Dict]]:
+        """Return all tool calls found in text (deduped, order preserved)."""
         if not text:
-            return None
-        # Prefer fenced JSON blocks first
+            return []
+        results: List[Tuple[str, Dict]] = []
+        seen = set()
+
+        def add_many(items: List[Tuple[str, Dict]]):
+            for name, args in items:
+                key = (name, json.dumps(args, sort_keys=True, default=str))
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append((name, args))
+
         blocks = re.findall(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL | re.IGNORECASE)
         for block in blocks:
             try:
                 data = json.loads(block.strip())
-                found = ToolCallDetector._from_parsed(data)
-                if found:
-                    return found
+                bucket: List[Tuple[str, Dict]] = []
+                ToolCallDetector._collect_from_parsed(data, bucket)
+                add_many(bucket)
             except json.JSONDecodeError:
                 continue
 
-        # Whole-text JSON
         stripped = text.strip()
         if stripped.startswith("{") or stripped.startswith("["):
             try:
                 data = json.loads(stripped)
-                found = ToolCallDetector._from_parsed(data)
-                if found:
-                    return found
+                bucket = []
+                ToolCallDetector._collect_from_parsed(data, bucket)
+                add_many(bucket)
             except json.JSONDecodeError:
                 pass
 
-        for obj_str in _extract_json_objects(text):
-            if '"name"' not in obj_str and '"tool"' not in obj_str and '"function"' not in obj_str:
-                continue
-            try:
-                data = json.loads(obj_str)
-                found = ToolCallDetector._from_parsed(data)
-                if found:
-                    return found
-            except json.JSONDecodeError:
-                continue
-        return None
+        if not results:
+            for obj_str in _extract_json_objects(text):
+                if '"name"' not in obj_str and '"tool"' not in obj_str and '"function"' not in obj_str:
+                    continue
+                try:
+                    data = json.loads(obj_str)
+                    bucket = []
+                    ToolCallDetector._collect_from_parsed(data, bucket)
+                    add_many(bucket)
+                except json.JSONDecodeError:
+                    continue
+
+        return results
+
+    @staticmethod
+    def detect(text: str) -> Optional[Tuple[str, Dict]]:
+        all_found = ToolCallDetector.detect_all(text)
+        return all_found[0] if all_found else None
