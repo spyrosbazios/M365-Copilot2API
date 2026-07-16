@@ -93,6 +93,9 @@ HALLUCINATION_PATTERNS = [
         r"helpers? (are )?not available",
         r"helper interface",
         r"not available in this environment",
+        r"not an available tool",
+        r"can'?t emit or invoke",
+        r"cannot emit or invoke",
         r"environment i can access",
         r"drwx.*\boai\b",
     )
@@ -170,6 +173,25 @@ def needs_local_tools(messages: List[dict]) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in LOCAL_ACTION_PATTERNS)
+
+
+def needs_web_tools(messages: List[dict]) -> bool:
+    text = _latest_user_text(messages)
+    if not text:
+        return False
+    return any(p.search(text) for p in WEB_ACTION_PATTERNS)
+
+
+def needs_context_followup(messages: List[dict]) -> bool:
+    text = _latest_user_text(messages)
+    if not text:
+        return False
+    return any(p.search(text) for p in CONTEXT_FOLLOWUP_PATTERNS)
+
+
+def needs_agent_tools(messages: List[dict]) -> bool:
+    """Any turn that should keep tools (local or web)."""
+    return needs_local_tools(messages) or needs_web_tools(messages)
 
 
 def suggest_local_command(user_text: str) -> str:
@@ -635,18 +657,27 @@ def prepare_chat_request(
     """
     wants_tools = bool(tools) and (
         not FAST_PATH
-        or needs_local_tools(messages)
+        or needs_agent_tools(messages)
         or _tool_choice_forces_tools(tool_choice)
     )
+    keep_context = needs_context_followup(messages)
 
     if wants_tools:
         compressed = compress_messages(
             messages,
             system_max=SYSTEM_MAX_CHARS,
-            history_max=HISTORY_MAX_MSGS,
+            history_max=max(HISTORY_MAX_MSGS, 16 if keep_context else HISTORY_MAX_MSGS),
         )
         aliased_tools, alias_to_real = prepare_tools(tools)
-        force_local = needs_local_tools(compressed) or _tool_choice_forces_tools(tool_choice)
+        # Prefer web helpers when the ask is research-shaped
+        if needs_web_tools(compressed):
+            # Put web tools first so examples / priority favor them
+            def _is_web(t):
+                n = ((t.get("function") or t).get("name") or "").lower()
+                return any(k in n for k in ("web", "search", "lookup", "fetch", "browse", "page"))
+            aliased_tools = sorted(aliased_tools, key=lambda t: (0 if _is_web(t) else 1))
+
+        force_local = needs_agent_tools(compressed) or _tool_choice_forces_tools(tool_choice)
 
         for m in compressed:
             if m.get("role") == "system":
@@ -663,22 +694,31 @@ def prepare_chat_request(
         )
         mode = "agent"
     else:
-        # FAST PATH: no tool schemas, tiny system, short history, live stream
+        # FAST PATH: no tool schemas, tiny system, live stream
+        # Keep more history for "as we discussed" follow-ups
+        hist = max(HISTORY_MAX_MSGS_FAST, 12 if keep_context else HISTORY_MAX_MSGS_FAST)
+        sys_max = max(SYSTEM_MAX_CHARS_FAST, 1200 if keep_context else SYSTEM_MAX_CHARS_FAST)
         compressed = compress_messages(
             messages,
-            system_max=SYSTEM_MAX_CHARS_FAST,
-            history_max=HISTORY_MAX_MSGS_FAST,
+            system_max=sys_max,
+            history_max=hist,
         )
-        # Drop heavy agent system noise for Q&A
         for m in compressed:
             if m.get("role") == "system":
                 body = _message_text(m.get("content"))
-                # Keep only a short assistant identity line
-                m["content"] = _truncate(
-                    "Answer clearly and concisely.\n" + body,
-                    SYSTEM_MAX_CHARS_FAST,
+                prefix = (
+                    "Answer clearly and concisely. "
+                    "Use prior messages in this conversation when the user refers to them.\n"
                 )
+                m["content"] = _truncate(prefix + body, sys_max)
                 break
+        # Soft-trim assistant history less aggressively on follow-ups
+        if keep_context:
+            for m in compressed:
+                if m.get("role") == "assistant":
+                    text = _message_text(m.get("content"))
+                    if text and len(text) > 1500:
+                        _set_message_text(m, _truncate(text, 1500))
         aliased_tools, alias_to_real = [], {}
         force_local = False
         mode = "fast"
