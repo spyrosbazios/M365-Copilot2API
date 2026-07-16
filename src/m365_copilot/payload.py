@@ -205,6 +205,26 @@ def build_payload_with_tools(hex_sid, uuid_sid, text, tone="Magic", gpt_override
     return p
 
 
+def _message_text(content):
+    """Normalize OpenAI message content (string or multimodal parts) to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, dict):
+                if part.get("type") == "text":
+                    texts.append(part.get("text") or "")
+                elif "text" in part and part.get("type") in (None, "text", "input_text"):
+                    texts.append(part.get("text") or "")
+        return "\n".join(t for t in texts if t)
+    return str(content)
+
+
 def build_conversation_payload(hex_sid, uuid_sid, messages, tone="Magic", gpt_override=None,
                                enable_image_gen=False, enable_file_upload=False, extra_options=None):
     inv_id = str(uuid.uuid4())
@@ -219,14 +239,27 @@ def build_conversation_payload(hex_sid, uuid_sid, messages, tone="Magic", gpt_ov
     if extra_options:
         options.extend(extra_options)
     m365_history = []
-    last_text = messages[-1].get("content", "") if messages else ""
 
-    for m in messages[:-1]:
+    # Fold system/developer prompts into the outgoing user text (M365 has no system role).
+    system_parts = []
+    chat_messages = []
+    for m in messages or []:
         role = m.get("role", "")
-        content = m.get("content", "")
-        if isinstance(content, list):
-            texts = [p.get("text", "") for p in content if p.get("type") == "text"]
-            content = " ".join(texts)
+        if role in ("system", "developer"):
+            text = _message_text(m.get("content", ""))
+            if text:
+                system_parts.append(text)
+        else:
+            chat_messages.append(m)
+
+    last_text = _message_text(chat_messages[-1].get("content", "")) if chat_messages else ""
+    if system_parts:
+        system_block = "\n\n".join(system_parts)
+        last_text = f"[System instructions]\n{system_block}\n\n[User]\n{last_text}" if last_text else system_block
+
+    for m in chat_messages[:-1]:
+        role = m.get("role", "")
+        content = _message_text(m.get("content", ""))
 
         if role == "user":
             m365_history.append({

@@ -5,7 +5,7 @@ from .. import __version__
 from ..auth import TokenManager
 from ..client import _clean_citations, M365Client
 from ..models import MODELS, lookup_model, TENANT_ID, USER_OID, CLIENT_ID, SCOPE
-from ..tools import provider
+from ..tools import provider, ToolCallDetector
 from ..tools.mcp_bridge import MCPBridge
 from ..scripts.plugin_loader import load_user_tools
 
@@ -67,19 +67,91 @@ def inject_tools_prompt(messages, tools):
             "parameters": fn.get("parameters", {}),
         })
     prompt = (
-        f"You have access to these tools:\n{json.dumps(tools_json, ensure_ascii=False)}\n\n"
-        'When you use a tool, respond with ONLY: {"name": "<tool_name>", "arguments": {<args>}}\n'
+        "Available helpers (optional). Use one when it clearly helps.\n"
+        f"{json.dumps(tools_json, ensure_ascii=False)}\n\n"
+        "When using a helper, reply with exactly one JSON object only, like:\n"
+        '{"name": "helper_name", "arguments": {"key": "value"}}\n'
+        "No markdown. No extra commentary around that JSON.\n"
+        "Otherwise answer in normal plain text.\n\n"
     )
     for m in reversed(messages):
         if m.get("role") == "user":
             content = m.get("content", "")
             if isinstance(content, list):
                 for part in content:
-                    if part.get("type") == "text":
-                        part["text"] = prompt + part["text"]
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        part["text"] = prompt + (part.get("text") or "")
+                        break
+                else:
+                    content.insert(0, {"type": "text", "text": prompt})
             else:
-                m["content"] = prompt + content
+                m["content"] = prompt + (content or "")
             break
+
+
+def _allowed_tool_names(tools):
+    names = set()
+    for t in tools or []:
+        fn = t.get("function", t) if isinstance(t, dict) else None
+        if isinstance(fn, dict) and fn.get("name"):
+            names.add(fn["name"])
+    return names
+
+
+def _args_to_json_str(args):
+    if args is None:
+        return "{}"
+    if isinstance(args, str):
+        try:
+            json.loads(args)
+            return args
+        except json.JSONDecodeError:
+            return json.dumps({"raw": args}, ensure_ascii=False)
+    return json.dumps(args, ensure_ascii=False)
+
+
+def _detect_text_tool_calls(text, tools=None):
+    """Parse prompt-injected tool JSON into OpenAI tool_calls."""
+    if not text or not str(text).strip():
+        return []
+    detected = ToolCallDetector.detect(str(text))
+    if not detected:
+        return []
+    name, args = detected
+    if not name:
+        return []
+    allowed = _allowed_tool_names(tools)
+    if allowed and name not in allowed:
+        return []
+    return [{
+        "id": f"call_{uuid.uuid4().hex}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": _args_to_json_str(args),
+        },
+    }]
+
+
+def _merge_tool_calls(native_tool_calls, text, tools=None):
+    """Prefer native M365 tool events; fall back to text JSON detection."""
+    if native_tool_calls:
+        return list(native_tool_calls), "tool_calls"
+    if tools:
+        parsed = _detect_text_tool_calls(text, tools)
+        if parsed:
+            return parsed, "tool_calls"
+    return [], "stop"
+
+
+def _usage_from(messages, text):
+    prompt_str = str(messages)
+    completion = (text or "").split()
+    return {
+        "prompt_tokens": len(prompt_str.split()),
+        "completion_tokens": len(completion),
+        "total_tokens": len(prompt_str.split()) + len(completion),
+    }
 
 
 def inject_json_mode(messages):
@@ -245,17 +317,33 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
 
         with _client_lock:
             if stream:
-                self._stream_chat(messages, cfg, client, conv_id)
+                self._stream_chat(messages, cfg, client, conv_id, tools=tools)
             else:
-                self._non_stream_chat(messages, cfg, client, conv_id)
+                self._non_stream_chat(messages, cfg, client, conv_id, tools=tools)
 
     def _write_sse(self, data):
         try:
             self.wfile.write(data.encode())
+            self.wfile.flush()
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
             pass
 
-    def _stream_chat(self, messages, cfg, client, conv_id=None):
+    def _emit_tool_call_chunks(self, tool_calls, chunk_id, openai_model):
+        self._write_sse(sse_msg({"role": "assistant", "content": None}, chunk_id, openai_model))
+        for i, tc in enumerate(tool_calls):
+            self._write_sse(sse_msg({
+                "tool_calls": [{
+                    "index": i,
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    },
+                }]
+            }, chunk_id, openai_model))
+
+    def _stream_chat(self, messages, cfg, client, conv_id=None, tools=None):
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -267,6 +355,8 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         openai_model = cfg["openai_id"]
         tone = cfg["tone"]
         gpt_override = cfg["override"]
+        # Buffer when tools are present so tool JSON is not shown as chat text.
+        buffer_for_tools = bool(tools)
 
         try:
             async def stream_loop():
@@ -280,76 +370,80 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                     if not chunk:
                         continue
                     full_text += chunk
+                    if buffer_for_tools:
+                        continue
                     if not has_content:
                         self._write_sse(sse_msg({"role": "assistant", "content": chunk}, chunk_id, openai_model))
                         has_content = True
                     else:
                         self._write_sse(sse_msg({"content": chunk}, chunk_id, openai_model))
 
-                if client._last_tool_calls:
-                    if not has_content:
-                        self._write_sse(sse_msg({"role": "assistant", "content": None}, chunk_id, openai_model))
-                    for i, tc in enumerate(client._last_tool_calls):
-                        self._write_sse(sse_msg({
-                            "tool_calls": [{"index": i, "id": tc["id"], "type": "function",
-                                            "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}]
-                        }, chunk_id, openai_model))
-                    prompt_str = str(messages)
-                    usage = {
-                        "prompt_tokens": len(prompt_str.split()),
-                        "completion_tokens": len(full_text.split()),
-                        "total_tokens": len(prompt_str.split()) + len(full_text.split()),
-                    }
+                tool_calls, finish_reason = _merge_tool_calls(
+                    client._last_tool_calls, full_text, tools=tools
+                )
+                usage = _usage_from(messages, full_text)
+
+                if tool_calls:
+                    logging.info(
+                        "Emitting tool_calls: %s",
+                        [tc["function"]["name"] for tc in tool_calls],
+                    )
+                    self._emit_tool_call_chunks(tool_calls, chunk_id, openai_model)
                     self._write_sse(sse_done(chunk_id, openai_model, usage, finish_reason="tool_calls"))
-                else:
-                    prompt_str = str(messages)
-                    usage = {
-                        "prompt_tokens": len(prompt_str.split()),
-                        "completion_tokens": len(full_text.split()),
-                        "total_tokens": len(prompt_str.split()) + len(full_text.split()),
-                    }
-                    self._write_sse(sse_done(chunk_id, openai_model, usage))
+                    return
+
+                if buffer_for_tools and full_text:
+                    self._write_sse(sse_msg({"role": "assistant", "content": full_text}, chunk_id, openai_model))
+                elif not has_content and not full_text:
+                    # empty completion
+                    self._write_sse(sse_msg({"role": "assistant", "content": ""}, chunk_id, openai_model))
+
+                self._write_sse(sse_done(chunk_id, openai_model, usage, finish_reason=finish_reason))
 
             _run_async(stream_loop())
         except Exception as e:
+            logging.exception("stream chat failed")
             err = {"id": chunk_id, "object": "chat.completion.chunk",
                    "created": int(time.time()), "model": openai_model,
                    "choices": [{"index": 0, "delta": {"content": f"Error: {e}"}, "finish_reason": "stop"}]}
             self._write_sse(f"data: {json.dumps(err)}\n\n")
             self._write_sse("data: [DONE]\n\n")
 
-    def _non_stream_chat(self, messages, cfg, client, conv_id=None):
+    def _non_stream_chat(self, messages, cfg, client, conv_id=None, tools=None):
         openai_model = cfg["openai_id"]
         tone = cfg["tone"]
         gpt_override = cfg["override"]
 
         try:
-            result_text, tool_calls, finish_reason = _run_async(
+            result_text, native_tool_calls, finish_reason = _run_async(
                 client.chat_conversation(messages, tone, gpt_override, conversation_id=conv_id)
             )
         except Exception as e:
             self._send_error(500, str(e))
             return
 
+        tool_calls, finish_reason = _merge_tool_calls(
+            native_tool_calls, result_text, tools=tools
+        )
+
         msg = {"role": "assistant", "content": result_text if result_text else None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
             msg["content"] = None
+            logging.info(
+                "Emitting tool_calls: %s",
+                [tc["function"]["name"] for tc in tool_calls],
+            )
         elif not result_text:
             msg["content"] = None
 
-        prompt_str = str(messages)
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": openai_model,
             "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
-            "usage": {
-                "prompt_tokens": len(prompt_str.split()),
-                "completion_tokens": len((result_text or "").split()),
-                "total_tokens": len(prompt_str.split()) + len((result_text or "").split()),
-            },
+            "usage": _usage_from(messages, result_text),
         }
         self._send_json(200, response)
 

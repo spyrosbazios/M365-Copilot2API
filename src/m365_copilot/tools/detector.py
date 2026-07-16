@@ -103,27 +103,60 @@ class ToolCallDetector:
         return None, None
 
     @staticmethod
+    def _from_parsed(data) -> Optional[Tuple[str, Dict]]:
+        if isinstance(data, list):
+            for item in data:
+                found = ToolCallDetector._from_parsed(item)
+                if found:
+                    return found
+            return None
+        if not isinstance(data, dict):
+            return None
+        # OpenAI-ish: {"tool_calls":[{"function":{...}}]}
+        if isinstance(data.get("tool_calls"), list):
+            for tc in data["tool_calls"]:
+                found = ToolCallDetector._from_parsed(tc)
+                if found:
+                    return found
+        name, args = ToolCallDetector._extract_name_and_args(data)
+        if name:
+            return name, ToolCallDetector._normalize_args(args)
+        return None
+
+    @staticmethod
     def detect(text: str) -> Optional[Tuple[str, Dict]]:
-        blocks = re.findall(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
+        if not text:
+            return None
+        # Prefer fenced JSON blocks first
+        blocks = re.findall(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL | re.IGNORECASE)
         for block in blocks:
             try:
                 data = json.loads(block.strip())
-                if isinstance(data, dict):
-                    name, args = ToolCallDetector._extract_name_and_args(data)
-                    if name:
-                        return name, ToolCallDetector._normalize_args(args)
+                found = ToolCallDetector._from_parsed(data)
+                if found:
+                    return found
             except json.JSONDecodeError:
                 continue
+
+        # Whole-text JSON
+        stripped = text.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+                found = ToolCallDetector._from_parsed(data)
+                if found:
+                    return found
+            except json.JSONDecodeError:
+                pass
 
         for obj_str in _extract_json_objects(text):
             if '"name"' not in obj_str and '"tool"' not in obj_str and '"function"' not in obj_str:
                 continue
             try:
                 data = json.loads(obj_str)
-                if isinstance(data, dict):
-                    name, args = ToolCallDetector._extract_name_and_args(data)
-                    if name:
-                        return name, ToolCallDetector._normalize_args(args)
+                found = ToolCallDetector._from_parsed(data)
+                if found:
+                    return found
             except json.JSONDecodeError:
                 continue
         return None
