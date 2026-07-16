@@ -274,10 +274,10 @@ def suggest_web_query(user_text: str) -> str:
     # Resolve pronouns via last assistant content (e.g. "the book")
     if recent and re.search(r"\b(the book|this book|that book|it)\b", t2, re.I):
         # Grab a likely title: quoted text or capitalized multi-word near "Deep Toilet" etc.
-        m = re.search(r"["'“]([^"'”]{4,80})["'”]", recent)
+        m = re.search(r'["\']([^"\']{4,80})["\']', recent)
         if not m:
             m = re.search(
-                r"\b([A-Z][A-Za-z0-9'’:,\-]+(?:\s+[A-Z0-9][A-Za-z0-9'’:,\-]*){1,8})\b",
+                r"\b([A-Z][A-Za-z0-9'':,\-]+(?:\s+[A-Z0-9][A-Za-z0-9'':,\-]*){1,8})\b",
                 recent,
             )
         if m:
