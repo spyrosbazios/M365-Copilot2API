@@ -281,8 +281,8 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
             messages, tools, tool_choice=tool_choice
         )
         logging.info(
-            "chat prepare model=%s msgs=%s tools=%s system_chars=%s force_local=%s",
-            model, meta.get("message_count"), meta.get("tool_count"),
+            "chat prepare model=%s mode=%s msgs=%s tools=%s system_chars=%s force_local=%s",
+            model, meta.get("mode"), meta.get("message_count"), meta.get("tool_count"),
             meta.get("system_chars"), meta.get("force_local"),
         )
 
@@ -300,11 +300,13 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                 self._stream_chat(
                     prepared, cfg, client, conv_id,
                     tools=aliased_tools, alias_to_real=alias_to_real, t0=t0,
+                    meta=meta,
                 )
             else:
                 self._non_stream_chat(
                     prepared, cfg, client, conv_id,
                     tools=aliased_tools, alias_to_real=alias_to_real, t0=t0,
+                    meta=meta,
                 )
 
     def _write_sse(self, data):
@@ -344,7 +346,7 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         yield "", full_text, True
 
     def _stream_chat(self, messages, cfg, client, conv_id=None, tools=None,
-                     alias_to_real=None, t0=None):
+                     alias_to_real=None, t0=None, meta=None):
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -357,12 +359,15 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         tone = cfg["tone"]
         gpt_override = cfg["override"]
         has_tools = bool(tools)
+        meta = meta or {}
+        agent_mode = meta.get("mode") == "agent" or has_tools
+        force_local = bool(meta.get("force_local"))
 
         try:
             async def stream_loop():
-                # Always buffer when tools are present so we can rewrite to
-                # tool_calls or retry without leaking hallucinated prose.
-                buffer_all = has_tools
+                # Buffer only in agent/tool mode (allows tool_calls rewrite + retry).
+                # Fast chat streams live for lower latency.
+                buffer_all = agent_mode
                 has_content = False
                 full_text = ""
 
@@ -400,9 +405,10 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                     tools=tools, alias_to_real=alias_to_real,
                 )
 
-                # One retry: refusal / hallucination / forced-local without tools
+                # One retry only in agent mode (avoid doubling pure-chat latency)
                 if (
-                    ao.REFUSAL_RETRY
+                    ao.AGENT_RETRY
+                    and agent_mode
                     and has_tools
                     and not tool_calls
                     and not client._last_tool_calls
@@ -416,7 +422,6 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                     retry_msgs = None
                     if ao.is_refusal(full_text):
                         _METRICS["refusals"] += 1
-                        # Even refusals: try to force a harmless helper path
                         retry_msgs = ao.force_tool_retry_messages(messages, preferred)
                         logging.info("Refusal detected; forcing helper retry")
                     elif ao.is_tool_hallucination(full_text):
@@ -426,7 +431,7 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                             "Tool hallucination detected; forcing helper retry (%s)",
                             preferred,
                         )
-                    elif ao.needs_local_tools(messages):
+                    elif force_local:
                         # Local action requested but model answered in prose
                         retry_msgs = ao.force_tool_retry_messages(messages, preferred)
                         logging.info(
@@ -481,7 +486,10 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
             self._write_sse("data: [DONE]\n\n")
 
     def _non_stream_chat(self, messages, cfg, client, conv_id=None, tools=None,
-                         alias_to_real=None, t0=None):
+                         alias_to_real=None, t0=None, meta=None):
+        meta = meta or {}
+        agent_mode = meta.get("mode") == "agent" or bool(tools)
+        force_local = bool(meta.get("force_local"))
         openai_model = cfg["openai_id"]
         tone = cfg["tone"]
         gpt_override = cfg["override"]
@@ -503,7 +511,7 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
             tools=tools, alias_to_real=alias_to_real,
         )
 
-        if ao.REFUSAL_RETRY and tools and not tool_calls:
+        if ao.AGENT_RETRY and agent_mode and tools and not tool_calls:
             preferred = "run_command"
             for t in tools or []:
                 n = (t.get("function") or t).get("name")
@@ -519,7 +527,7 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                 _METRICS["refusals"] += 1
                 retry_msgs = ao.force_tool_retry_messages(messages, preferred)
                 logging.info("Tool hallucination detected; forcing helper retry")
-            elif ao.needs_local_tools(messages):
+            elif force_local:
                 retry_msgs = ao.force_tool_retry_messages(messages, preferred)
                 logging.info("Local action without tools; forcing helper retry")
             if retry_msgs is not None:

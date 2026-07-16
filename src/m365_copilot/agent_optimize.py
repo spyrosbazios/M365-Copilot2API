@@ -19,13 +19,19 @@ from typing import Any, Dict, List, Optional, Tuple
 from .tools.detector import ToolCallDetector
 
 # Env knobs (all optional)
-SYSTEM_MAX_CHARS = int(os.environ.get("M365_SYSTEM_MAX_CHARS", "2500"))
-TOOL_DESC_MAX = int(os.environ.get("M365_TOOL_DESC_MAX", "120"))
-TOOL_RESULT_MAX = int(os.environ.get("M365_TOOL_RESULT_MAX", "1500"))
-HISTORY_MAX_MSGS = int(os.environ.get("M365_HISTORY_MAX_MSGS", "12"))
-MAX_TOOLS = int(os.environ.get("M365_MAX_TOOLS", "24"))
+SYSTEM_MAX_CHARS = int(os.environ.get("M365_SYSTEM_MAX_CHARS", "1800"))
+SYSTEM_MAX_CHARS_FAST = int(os.environ.get("M365_SYSTEM_MAX_CHARS_FAST", "600"))
+TOOL_DESC_MAX = int(os.environ.get("M365_TOOL_DESC_MAX", "80"))
+TOOL_RESULT_MAX = int(os.environ.get("M365_TOOL_RESULT_MAX", "1200"))
+HISTORY_MAX_MSGS = int(os.environ.get("M365_HISTORY_MAX_MSGS", "10"))
+HISTORY_MAX_MSGS_FAST = int(os.environ.get("M365_HISTORY_MAX_MSGS_FAST", "6"))
+MAX_TOOLS = int(os.environ.get("M365_MAX_TOOLS", "12"))
+# Drop tools for pure chat (huge speed win when Pi always sends 20+ tools)
+FAST_PATH = os.environ.get("M365_FAST_PATH", "1") != "0"
 ENABLE_BING = os.environ.get("M365_ENABLE_BING", "0") == "1"
 REFUSAL_RETRY = os.environ.get("M365_REFUSAL_RETRY", "1") != "0"
+# Retry only for agent/local turns (never double pure chat latency)
+AGENT_RETRY = os.environ.get("M365_AGENT_RETRY", "1") != "0"
 
 # Real tool name -> safer alias shown to the model
 TOOL_ALIASES = {
@@ -84,6 +90,11 @@ HALLUCINATION_PATTERNS = [
         r"paste the output",
         r"i'?m (just |only )?a language model",
         r"as an ai (language )?model",
+        r"helpers? (are )?not available",
+        r"helper interface",
+        r"not available in this environment",
+        r"environment i can access",
+        r"drwx.*\boai\b",
     )
 ]
 
@@ -323,10 +334,17 @@ def prepare_tools(tools: Optional[List[dict]]) -> Tuple[List[dict], Dict[str, st
     return prepared, alias_to_real
 
 
-def compress_messages(messages: List[dict]) -> List[dict]:
+def compress_messages(
+    messages: List[dict],
+    system_max: Optional[int] = None,
+    history_max: Optional[int] = None,
+) -> List[dict]:
     """Deep-copy and compress history for M365 payload size."""
     if not messages:
         return []
+
+    sys_limit = SYSTEM_MAX_CHARS if system_max is None else system_max
+    hist_limit = HISTORY_MAX_MSGS if history_max is None else history_max
 
     msgs = copy.deepcopy(messages)
     system_parts: List[str] = []
@@ -343,9 +361,9 @@ def compress_messages(messages: List[dict]) -> List[dict]:
 
     # Cap system: keep head + tail (instructions + recent constraints)
     system_text = "\n\n".join(system_parts)
-    if len(system_text) > SYSTEM_MAX_CHARS:
-        head = SYSTEM_MAX_CHARS * 2 // 3
-        tail = SYSTEM_MAX_CHARS - head - 40
+    if len(system_text) > sys_limit:
+        head = sys_limit * 2 // 3
+        tail = sys_limit - head - 40
         system_text = (
             system_text[:head]
             + "\n…[system truncated]…\n"
@@ -375,8 +393,8 @@ def compress_messages(messages: List[dict]) -> List[dict]:
             _set_message_text(m, _truncate(text, 6000))
 
     # Keep last N non-system messages
-    if len(others) > HISTORY_MAX_MSGS:
-        others = others[-HISTORY_MAX_MSGS:]
+    if len(others) > hist_limit:
+        others = others[-hist_limit:]
 
     out: List[dict] = []
     if system_text:
@@ -593,6 +611,14 @@ def looks_like_tool_json(text: str) -> bool:
     return False
 
 
+def _tool_choice_forces_tools(tool_choice: Any) -> bool:
+    if tool_choice == "required":
+        return True
+    if isinstance(tool_choice, dict):
+        return True
+    return False
+
+
 def prepare_chat_request(
     messages: List[dict],
     tools: Optional[List[dict]],
@@ -601,21 +627,30 @@ def prepare_chat_request(
     """
     Full pre-process for a chat completion request.
 
+    Fast path (default): pure chat with no local-action intent drops tools,
+    trims system/history hard, and streams without agent retry overhead.
+
     Returns:
       messages_out, tools_for_detect (aliased), alias_to_real, meta
     """
-    compressed = compress_messages(messages)
-    aliased_tools, alias_to_real = prepare_tools(tools)
+    wants_tools = bool(tools) and (
+        not FAST_PATH
+        or needs_local_tools(messages)
+        or _tool_choice_forces_tools(tool_choice)
+    )
 
-    force_local = False
-    if aliased_tools:
-        force_local = needs_local_tools(compressed) or tool_choice == "required"
-        # Always inject short non-truncatable local rules + helpers
-        # Replace oversized system with rules + truncated original
+    if wants_tools:
+        compressed = compress_messages(
+            messages,
+            system_max=SYSTEM_MAX_CHARS,
+            history_max=HISTORY_MAX_MSGS,
+        )
+        aliased_tools, alias_to_real = prepare_tools(tools)
+        force_local = needs_local_tools(compressed) or _tool_choice_forces_tools(tool_choice)
+
         for m in compressed:
             if m.get("role") == "system":
                 body = _message_text(m.get("content"))
-                # Keep agent rules first so they survive any later folding
                 m["content"] = AGENT_LOCAL_RULES + "\n" + body
                 break
         else:
@@ -626,8 +661,30 @@ def prepare_chat_request(
             tool_choice=tool_choice,
             force_local=force_local,
         )
+        mode = "agent"
+    else:
+        # FAST PATH: no tool schemas, tiny system, short history, live stream
+        compressed = compress_messages(
+            messages,
+            system_max=SYSTEM_MAX_CHARS_FAST,
+            history_max=HISTORY_MAX_MSGS_FAST,
+        )
+        # Drop heavy agent system noise for Q&A
+        for m in compressed:
+            if m.get("role") == "system":
+                body = _message_text(m.get("content"))
+                # Keep only a short assistant identity line
+                m["content"] = _truncate(
+                    "Answer clearly and concisely.\n" + body,
+                    SYSTEM_MAX_CHARS_FAST,
+                )
+                break
+        aliased_tools, alias_to_real = [], {}
+        force_local = False
+        mode = "fast"
 
     meta = {
+        "mode": mode,
         "system_chars": sum(
             len(_message_text(m.get("content")))
             for m in compressed if m.get("role") == "system"
