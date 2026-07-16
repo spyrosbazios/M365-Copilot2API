@@ -263,6 +263,9 @@ def suggest_web_query(user_text: str) -> str:
         t = parts[-1].strip()
     elif "[Recent conversation]" in t:
         recent = t
+    # Drop our injected follow-up hint footer
+    t = re.split(r"\n\(Use the recent conversation", t, maxsplit=1)[0].strip()
+    recent = re.split(r"\n\(Use the recent conversation", recent, maxsplit=1)[0]
     # strip leading/trailing search phrasing
     t2 = re.sub(
         r"^(search|searhc|serach|google|look\s*up)\s+(the\s+)?(web\s+)?(for\s+)?",
@@ -272,7 +275,7 @@ def suggest_web_query(user_text: str) -> str:
     t2 = re.sub(r"\?+$", "", t2).strip()
 
     # Resolve pronouns via last assistant content (e.g. "the book")
-    if recent and re.search(r"\b(the book|this book|that book|it)\b", t2, re.I):
+    if recent and re.search(r"\b(the book|this book|that book|it|about)\b", t2, re.I):
         title = None
         m = re.search(r'["\']([^"\']{4,80})["\']', recent)
         if m:
