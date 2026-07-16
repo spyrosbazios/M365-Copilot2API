@@ -273,16 +273,21 @@ def suggest_web_query(user_text: str) -> str:
 
     # Resolve pronouns via last assistant content (e.g. "the book")
     if recent and re.search(r"\b(the book|this book|that book|it)\b", t2, re.I):
-        # Grab a likely title: quoted text or capitalized multi-word near "Deep Toilet" etc.
+        title = None
         m = re.search(r'["\']([^"\']{4,80})["\']', recent)
-        if not m:
-            m = re.search(
-                r"\b([A-Z][A-Za-z0-9'':,\-]+(?:\s+[A-Z0-9][A-Za-z0-9'':,\-]*){1,8})\b",
-                recent,
-            )
         if m:
             title = m.group(1).strip()
-            t2 = f"{title} book summary review"
+        if not title:
+            m = re.search(
+                r"(?:go with|recommend(?:ed)?|pick(?:ed)?|choose|select|titled)\s+"
+                r"([A-Z][^\n.!?]{5,90})",
+                recent,
+                re.I,
+            )
+            if m:
+                title = m.group(1).strip().rstrip("!.,;:")
+        if title:
+            t2 = f"{title} book summary review what is it about"
 
     return t2 or t or "best short bathroom books"
 
