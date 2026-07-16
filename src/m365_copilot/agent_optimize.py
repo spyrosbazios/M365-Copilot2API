@@ -219,6 +219,44 @@ def needs_agent_tools(messages: List[dict]) -> bool:
     return needs_local_tools(messages) or needs_web_tools(messages)
 
 
+def is_fake_search(text: str) -> bool:
+    """Model claims to search but answers from memory (no tool JSON)."""
+    if not text or looks_like_tool_json(text):
+        return False
+    return bool(re.search(
+        r"(i('ll| will) search|ok[,.]? i.?ll search|searching (the web )?for|"
+        r"let me search|looking (that )?up online|i (just )?searched)",
+        text, re.I,
+    ))
+
+
+def preferred_helper_for(messages: List[dict], tools: Optional[List[dict]]) -> str:
+    """Pick best helper name (aliased) for retry/examples."""
+    names = []
+    for t in tools or []:
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        if isinstance(fn, dict) and fn.get("name"):
+            names.append(fn["name"])
+    if needs_web_tools(messages):
+        for cand in ("web_lookup", "web_search", "fetch_url", "open_page", "search_text"):
+            if cand in names:
+                return cand
+    for cand in ("run_command", "bash", "read_file", "read", "search_text"):
+        if cand in names:
+            return cand
+    return names[0] if names else "run_command"
+
+
+def suggest_web_query(user_text: str) -> str:
+    t = (user_text or "").strip()
+    # strip leading "search the web for"
+    t2 = re.sub(
+        r"^(search|searhc|serach|google|look\s*up)\s+(the\s+)?(web\s+)?(for\s+)?",
+        "", t, flags=re.I,
+    ).strip()
+    return t2 or t or "best short bathroom books"
+
+
 def suggest_local_command(user_text: str) -> str:
     """Best-effort shell command for common agent asks (used only as JSON example)."""
     t = (user_text or "").lower()
@@ -478,14 +516,23 @@ def build_tools_prompt(
         force_name = fn.get("name")
         force = bool(force_name) or force
 
+    names = [t.get("name") for t in tools_json if t.get("name")]
+    web_ask = bool(user_text and any(p.search(user_text) for p in WEB_ACTION_PATTERNS))
     preferred = None
-    for cand in ("run_command", "bash", "read_file", "read", "search_text", "eza"):
-        if any(t.get("name") == cand for t in tools_json):
-            preferred = cand
-            break
+    if web_ask:
+        for cand in ("web_lookup", "web_search", "fetch_url", "open_page"):
+            if cand in names:
+                preferred = cand
+                break
+    if not preferred:
+        for cand in ("run_command", "bash", "read_file", "read", "search_text", "eza"):
+            if cand in names:
+                preferred = cand
+                break
 
     lines = [
         AGENT_LOCAL_RULES.rstrip(),
+        "For web research you MUST call a web helper first; never invent search results.",
         f"Helpers: {json.dumps(tools_json, ensure_ascii=False)}",
         "",
     ]
@@ -495,7 +542,7 @@ def build_tools_prompt(
         hint = f' (e.g. "{preferred}")' if preferred else ""
         lines.append(
             f"This request needs a helper{hint}. "
-            "Output ONLY the helper JSON now — no explanation."
+            "Output ONLY the helper JSON now — no explanation, no book lists yet."
         )
         if preferred in ("run_command", "bash"):
             cmd = suggest_local_command(user_text or "")
@@ -503,6 +550,16 @@ def build_tools_prompt(
                 "Example shape only: "
                 + json.dumps(
                     {"name": preferred, "arguments": {"command": cmd}},
+                    ensure_ascii=False,
+                )
+            )
+        elif preferred in ("web_lookup", "web_search"):
+            q = suggest_web_query(user_text or "")
+            # Common arg names across web tools
+            lines.append(
+                "Example shape only: "
+                + json.dumps(
+                    {"name": preferred, "arguments": {"query": q}},
                     ensure_ascii=False,
                 )
             )
@@ -554,11 +611,18 @@ def refusal_retry_messages(messages: List[dict]) -> List[dict]:
 def force_tool_retry_messages(messages: List[dict], preferred_helper: str = "run_command") -> List[dict]:
     """Retry when the model hallucinated instead of calling tools."""
     msgs = copy.deepcopy(messages)
+    user_text = _latest_user_text(messages)
     # Keep example mild — aggressive shell/path wording triggers M365 blocks.
     if preferred_helper in ("run_command", "bash"):
-        cmd = suggest_local_command(_latest_user_text(messages))
+        cmd = suggest_local_command(user_text)
         example = json.dumps(
             {"name": preferred_helper, "arguments": {"command": cmd}},
+            ensure_ascii=False,
+        )
+    elif preferred_helper in ("web_lookup", "web_search"):
+        q = suggest_web_query(user_text)
+        example = json.dumps(
+            {"name": preferred_helper, "arguments": {"query": q}},
             ensure_ascii=False,
         )
     elif preferred_helper in ("read_file", "read"):
@@ -570,8 +634,8 @@ def force_tool_retry_messages(messages: List[dict], preferred_helper: str = "run
         example = f'{{"name":"{preferred_helper}","arguments":{{}}}}'
 
     soft = (
-        "\n\n[Retry] Do not invent results. "
-        "Output ONLY one helper JSON object now (no markdown, no apology), e.g.\n"
+        "\n\n[Retry] Do not invent results or pretend you searched. "
+        "Output ONLY one helper JSON object now (no markdown, no book list), e.g.\n"
         f"{example}\n"
     )
     for m in reversed(msgs):

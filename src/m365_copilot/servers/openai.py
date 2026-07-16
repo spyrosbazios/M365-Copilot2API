@@ -413,29 +413,28 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                     and not tool_calls
                     and not client._last_tool_calls
                 ):
-                    preferred = "run_command"
-                    for t in tools or []:
-                        n = (t.get("function") or t).get("name")
-                        if n in ("run_command", "bash", "read_file", "read"):
-                            preferred = n
-                            break
+                    preferred = ao.preferred_helper_for(messages, tools)
                     retry_msgs = None
                     if ao.is_refusal(full_text):
                         _METRICS["refusals"] += 1
                         retry_msgs = ao.force_tool_retry_messages(messages, preferred)
                         logging.info("Refusal detected; forcing helper retry")
-                    elif ao.is_tool_hallucination(full_text):
+                    elif ao.is_tool_hallucination(full_text) or ao.is_fake_search(full_text):
                         _METRICS["refusals"] += 1
                         retry_msgs = ao.force_tool_retry_messages(messages, preferred)
                         logging.info(
-                            "Tool hallucination detected; forcing helper retry (%s)",
+                            "Fake tool/search detected; forcing helper retry (%s)",
                             preferred,
                         )
-                    elif force_local:
-                        # Local action requested but model answered in prose
+                    elif force_local and (
+                        ao.needs_web_tools(messages)
+                        or len((full_text or "").strip()) < 280
+                    ):
+                        # Web asks always retry if no tool_calls (models often dump memory lists).
+                        # Local: only short prose dodge (skip long answers for latency).
                         retry_msgs = ao.force_tool_retry_messages(messages, preferred)
                         logging.info(
-                            "Local action without tools; forcing helper retry (%s)",
+                            "Agent action without tools; forcing helper retry (%s)",
                             preferred,
                         )
                     if retry_msgs is not None:
@@ -512,24 +511,22 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         )
 
         if ao.AGENT_RETRY and agent_mode and tools and not tool_calls:
-            preferred = "run_command"
-            for t in tools or []:
-                n = (t.get("function") or t).get("name")
-                if n in ("run_command", "bash", "read_file", "read"):
-                    preferred = n
-                    break
+            preferred = ao.preferred_helper_for(messages, tools)
             retry_msgs = None
             if ao.is_refusal(result_text):
                 _METRICS["refusals"] += 1
                 retry_msgs = ao.force_tool_retry_messages(messages, preferred)
                 logging.info("Refusal detected; forcing helper retry")
-            elif ao.is_tool_hallucination(result_text):
+            elif ao.is_tool_hallucination(result_text) or ao.is_fake_search(result_text):
                 _METRICS["refusals"] += 1
                 retry_msgs = ao.force_tool_retry_messages(messages, preferred)
-                logging.info("Tool hallucination detected; forcing helper retry")
-            elif force_local:
+                logging.info("Fake tool/search detected; forcing helper retry")
+            elif force_local and (
+                ao.needs_web_tools(messages)
+                or len((result_text or "").strip()) < 280
+            ):
                 retry_msgs = ao.force_tool_retry_messages(messages, preferred)
-                logging.info("Local action without tools; forcing helper retry")
+                logging.info("Agent action without tools; forcing helper retry")
             if retry_msgs is not None:
                 _METRICS["retries"] += 1
                 try:
