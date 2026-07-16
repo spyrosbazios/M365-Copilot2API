@@ -113,6 +113,31 @@ LOCAL_ACTION_PATTERNS = [
     )
 ]
 
+# Web / research tools (also catches common typos like "searhc")
+WEB_ACTION_PATTERNS = [
+    re.compile(p, re.I)
+    for p in (
+        r"\b(web|online|internet|google|bing|duckduckgo|ddg|browser)\b",
+        r"\b(search|searhc|serach|lookup|look\s*up)\b",
+        r"\b(browse|fetch)\s+(url|page|site|http)",
+        r"https?://",
+        r"\b(news|headline|current events|latest on)\b",
+    )
+]
+
+# Keep more history for conversational follow-ups
+CONTEXT_FOLLOWUP_PATTERNS = [
+    re.compile(p, re.I)
+    for p in (
+        r"\b(previous|previously|earlier|above|before|last time)\b",
+        r"\b(we|you)\s+(discussed|said|mentioned|talked|covered)\b",
+        r"\b(that|those|this|it)\s+(book|topic|list|idea|one)",
+        r"\bas (i|we)\s+(said|asked|mentioned)\b",
+        r"\b(continue|pick up|from there|same topic)\b",
+        r"\b(descuss|discuss|discused|discussed)\b",
+    )
+]
+
 AGENT_LOCAL_RULES = (
     "LOCAL MACHINE RULES (always):\n"
     "- You run on the user's real machine via helpers. Never invent file listings or paths.\n"
