@@ -19,19 +19,21 @@ from typing import Any, Dict, List, Optional, Tuple
 from .tools.detector import ToolCallDetector
 
 # Env knobs (all optional)
-SYSTEM_MAX_CHARS = int(os.environ.get("M365_SYSTEM_MAX_CHARS", "1800"))
-SYSTEM_MAX_CHARS_FAST = int(os.environ.get("M365_SYSTEM_MAX_CHARS_FAST", "600"))
-TOOL_DESC_MAX = int(os.environ.get("M365_TOOL_DESC_MAX", "80"))
-TOOL_RESULT_MAX = int(os.environ.get("M365_TOOL_RESULT_MAX", "1200"))
-HISTORY_MAX_MSGS = int(os.environ.get("M365_HISTORY_MAX_MSGS", "10"))
-HISTORY_MAX_MSGS_FAST = int(os.environ.get("M365_HISTORY_MAX_MSGS_FAST", "6"))
-MAX_TOOLS = int(os.environ.get("M365_MAX_TOOLS", "12"))
+SYSTEM_MAX_CHARS = int(os.environ.get("M365_SYSTEM_MAX_CHARS", "1000"))
+SYSTEM_MAX_CHARS_FAST = int(os.environ.get("M365_SYSTEM_MAX_CHARS_FAST", "400"))
+TOOL_DESC_MAX = int(os.environ.get("M365_TOOL_DESC_MAX", "60"))
+TOOL_RESULT_MAX = int(os.environ.get("M365_TOOL_RESULT_MAX", "800"))
+HISTORY_MAX_MSGS = int(os.environ.get("M365_HISTORY_MAX_MSGS", "6"))
+HISTORY_MAX_MSGS_FAST = int(os.environ.get("M365_HISTORY_MAX_MSGS_FAST", "4"))
+MAX_TOOLS = int(os.environ.get("M365_MAX_TOOLS", "6"))
 # Drop tools for pure chat (huge speed win when Pi always sends 20+ tools)
 FAST_PATH = os.environ.get("M365_FAST_PATH", "1") != "0"
 ENABLE_BING = os.environ.get("M365_ENABLE_BING", "0") == "1"
-REFUSAL_RETRY = os.environ.get("M365_REFUSAL_RETRY", "1") != "0"
-# Retry only for agent/local turns (never double pure chat latency)
-AGENT_RETRY = os.environ.get("M365_AGENT_RETRY", "1") != "0"
+REFUSAL_RETRY = os.environ.get("M365_REFUSAL_RETRY", "0") != "0"
+# Default OFF: a retry doubles M365 RTT (~+8–15s). Enable if you prefer quality.
+AGENT_RETRY = os.environ.get("M365_AGENT_RETRY", "0") != "0"
+# Only keep web tools for web asks / local tools for shell asks
+SCOPED_TOOLS = os.environ.get("M365_SCOPED_TOOLS", "1") != "0"
 
 # Real tool name -> safer alias shown to the model
 TOOL_ALIASES = {
@@ -365,7 +367,42 @@ def real_name_for(name: str, allowed_real: Optional[set] = None) -> str:
     return name
 
 
-def prepare_tools(tools: Optional[List[dict]]) -> Tuple[List[dict], Dict[str, str]]:
+def _scope_tools(tools: List[dict], messages: Optional[List[dict]] = None) -> List[dict]:
+    """Keep only tools relevant to the ask — big latency win on M365 payload size."""
+    if not SCOPED_TOOLS or not tools:
+        return tools
+    web = needs_web_tools(messages or [])
+    local = needs_local_tools(messages or [])
+
+    def name_of(t):
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        return ((fn or {}).get("name") or "").lower()
+
+    def is_web(n):
+        return any(k in n for k in ("web", "search", "lookup", "fetch", "browse", "page", "http"))
+
+    def is_local(n):
+        return any(k in n for k in (
+            "bash", "shell", "read", "write", "edit", "grep", "find", "rg", "fd",
+            "eza", "ls", "git", "command", "file", "path",
+        ))
+
+    if web and not local:
+        scoped = [t for t in tools if is_web(name_of(t))]
+        return scoped or tools[:MAX_TOOLS]
+    if local and not web:
+        scoped = [t for t in tools if is_local(name_of(t))]
+        return scoped or tools[:MAX_TOOLS]
+    if web and local:
+        scoped = [t for t in tools if is_web(name_of(t)) or is_local(name_of(t))]
+        return scoped or tools[:MAX_TOOLS]
+    return tools
+
+
+def prepare_tools(
+    tools: Optional[List[dict]],
+    messages: Optional[List[dict]] = None,
+) -> Tuple[List[dict], Dict[str, str]]:
     """
     Returns (aliased_slim_tools, alias_to_real map for this request).
     alias_to_real maps what the model sees -> original OpenAI tool name.
@@ -373,13 +410,15 @@ def prepare_tools(tools: Optional[List[dict]]) -> Tuple[List[dict], Dict[str, st
     if not tools:
         return [], {}
 
+    tools = _scope_tools(list(tools), messages)
+
     alias_to_real: Dict[str, str] = {}
     prepared: List[dict] = []
 
     # Prefer high-value coding tools first if we must cap
     priority = {
         "bash": 0, "read": 1, "edit": 2, "write": 3, "grep": 4, "rg": 4,
-        "find": 5, "fd": 5, "web_search": 10, "open_page": 11,
+        "find": 5, "fd": 5, "web_search": 0, "open_page": 1,
     }
 
     def sort_key(t):
@@ -860,10 +899,9 @@ def prepare_chat_request(
             system_max=SYSTEM_MAX_CHARS,
             history_max=max(HISTORY_MAX_MSGS, 16 if keep_context else HISTORY_MAX_MSGS),
         )
-        aliased_tools, alias_to_real = prepare_tools(tools)
+        aliased_tools, alias_to_real = prepare_tools(tools, messages=compressed)
         # Prefer web helpers when the ask is research-shaped
         if needs_web_tools(compressed):
-            # Put web tools first so examples / priority favor them
             def _is_web(t):
                 n = ((t.get("function") or t).get("name") or "").lower()
                 return any(k in n for k in ("web", "search", "lookup", "fetch", "browse", "page"))
@@ -871,10 +909,14 @@ def prepare_chat_request(
 
         force_local = needs_agent_tools(compressed) or _tool_choice_forces_tools(tool_choice)
 
+        # Keep agent system short — large prompts dominate M365 latency
         for m in compressed:
             if m.get("role") == "system":
                 body = _message_text(m.get("content"))
-                m["content"] = AGENT_LOCAL_RULES + "\n" + body
+                m["content"] = _truncate(
+                    AGENT_LOCAL_RULES + "\n" + body,
+                    SYSTEM_MAX_CHARS,
+                )
                 break
         else:
             compressed.insert(0, {"role": "system", "content": AGENT_LOCAL_RULES})
@@ -888,8 +930,8 @@ def prepare_chat_request(
     else:
         # FAST PATH: no tool schemas, tiny system, live stream
         # Keep more history for "as we discussed" follow-ups
-        hist = max(HISTORY_MAX_MSGS_FAST, 12 if keep_context else HISTORY_MAX_MSGS_FAST)
-        sys_max = max(SYSTEM_MAX_CHARS_FAST, 1200 if keep_context else SYSTEM_MAX_CHARS_FAST)
+        hist = max(HISTORY_MAX_MSGS_FAST, 8 if keep_context else HISTORY_MAX_MSGS_FAST)
+        sys_max = max(SYSTEM_MAX_CHARS_FAST, 700 if keep_context else SYSTEM_MAX_CHARS_FAST)
         compressed = compress_messages(
             messages,
             system_max=sys_max,

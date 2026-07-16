@@ -295,19 +295,19 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         )
         client = _get_client(session_key)
 
-        with _client_lock:
-            if stream:
-                self._stream_chat(
-                    prepared, cfg, client, conv_id,
-                    tools=aliased_tools, alias_to_real=alias_to_real, t0=t0,
-                    meta=meta,
-                )
-            else:
-                self._non_stream_chat(
-                    prepared, cfg, client, conv_id,
-                    tools=aliased_tools, alias_to_real=alias_to_real, t0=t0,
-                    meta=meta,
-                )
+        # Do not hold the global lock across M365 RTT — only client lookup is locked.
+        if stream:
+            self._stream_chat(
+                prepared, cfg, client, conv_id,
+                tools=aliased_tools, alias_to_real=alias_to_real, t0=t0,
+                meta=meta,
+            )
+        else:
+            self._non_stream_chat(
+                prepared, cfg, client, conv_id,
+                tools=aliased_tools, alias_to_real=alias_to_real, t0=t0,
+                meta=meta,
+            )
 
     def _write_sse(self, data):
         try:
@@ -365,16 +365,18 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             async def stream_loop():
-                # Buffer only in agent/tool mode (allows tool_calls rewrite + retry).
-                # Fast chat streams live for lower latency.
-                buffer_all = agent_mode
+                # Buffer only when we may rewrite into tool_calls. If retries are off,
+                # soft-buffer: stream once text no longer looks like tool JSON.
+                soft_stream = agent_mode and not ao.AGENT_RETRY
+                buffer_all = agent_mode and not soft_stream
                 has_content = False
                 full_text = ""
 
                 async def _drain(msg_list):
-                    nonlocal full_text, has_content
+                    nonlocal full_text, has_content, buffer_all
                     full_text = ""
                     has_content = False
+                    hold = ""
                     async for chunk, is_final in client.chat_conversation_stream_gen(
                         msg_list, tone, gpt_override, conversation_id=conv_id,
                         enable_bing=ao.ENABLE_BING,
@@ -387,6 +389,17 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                         full_text += chunk
                         if buffer_all:
                             continue
+                        if soft_stream and not has_content:
+                            hold += chunk
+                            # Still might be tool JSON — keep holding briefly
+                            if len(hold) < 48 and ao.looks_like_tool_json(hold):
+                                continue
+                            if ao.looks_like_tool_json(hold) and len(hold) < 400:
+                                # likely a tool call — stay buffered for rewrite
+                                buffer_all = True
+                                continue
+                            chunk = hold
+                            hold = ""
                         if not has_content:
                             self._write_sse(sse_msg(
                                 {"role": "assistant", "content": chunk},
@@ -846,9 +859,18 @@ def main():
         print(f"Token 澶辫触: {e}")
         sys.exit(1)
 
+    # Pre-warm SignalR so the first user request skips handshake RTT
+    try:
+        warm = _get_client("__warmup__")
+        _run_async(warm._ensure_ws())
+        print("WS pre-warmed")
+    except Exception as e:
+        print(f"WS pre-warm skipped: {e}")
+
     server = ThreadedServer((args.host, args.port), OpenAIHandler)
     print(f"M365 Copilot API Server v{__version__}")
     print(f"  http://{args.host}:{args.port}")
+    print(f"  mode: fast_path={ao.FAST_PATH} agent_retry={ao.AGENT_RETRY} scoped_tools={ao.SCOPED_TOOLS}")
     print(f"  POST /v1/chat/completions  (OpenAI)")
     print(f"  POST /v1/completions        (OpenAI FIM)")
     print(f"  POST /v1/messages           (Anthropic)")
