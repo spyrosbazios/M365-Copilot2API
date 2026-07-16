@@ -365,9 +365,9 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             async def stream_loop():
-                # Buffer only when we may rewrite into tool_calls. If retries are off,
-                # soft-buffer: stream once text no longer looks like tool JSON.
-                soft_stream = agent_mode and not ao.AGENT_RETRY
+                # Web asks always fully buffer so we can convert fake prose into tool_calls.
+                web_ask = ao.needs_web_tools(messages)
+                soft_stream = agent_mode and not ao.AGENT_RETRY and not web_ask
                 buffer_all = agent_mode and not soft_stream
                 has_content = False
                 full_text = ""
@@ -417,6 +417,18 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                     client._last_tool_calls, full_text,
                     tools=tools, alias_to_real=alias_to_real,
                 )
+                # Hard guarantee: web asks always produce a real tool_call for Pi
+                forced = ao.ensure_web_tool_calls(
+                    tool_calls, messages, tools=tools,
+                    alias_to_real=alias_to_real, full_text=full_text,
+                )
+                if forced and not tool_calls:
+                    tool_calls = forced
+                    finish_reason = "tool_calls"
+                    logging.info(
+                        "Forced web tool_call (model skipped tools): %s",
+                        [tc["function"]["name"] for tc in tool_calls],
+                    )
 
                 # One retry only in agent mode (avoid doubling pure-chat latency)
                 if (
@@ -522,6 +534,17 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
             native_tool_calls, result_text,
             tools=tools, alias_to_real=alias_to_real,
         )
+        forced = ao.ensure_web_tool_calls(
+            tool_calls, messages, tools=tools,
+            alias_to_real=alias_to_real, full_text=result_text or "",
+        )
+        if forced and not tool_calls:
+            tool_calls = forced
+            finish_reason = "tool_calls"
+            logging.info(
+                "Forced web tool_call (model skipped tools): %s",
+                [tc["function"]["name"] for tc in tool_calls],
+            )
 
         if ao.AGENT_RETRY and agent_mode and tools and not tool_calls:
             preferred = ao.preferred_helper_for(messages, tools)

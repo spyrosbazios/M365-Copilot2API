@@ -253,13 +253,104 @@ def preferred_helper_for(messages: List[dict], tools: Optional[List[dict]]) -> s
 
 
 def suggest_web_query(user_text: str) -> str:
-    t = (user_text or "").strip()
-    # strip leading "search the web for"
+    raw = (user_text or "").strip()
+    recent = ""
+    t = raw
+    # Prefer text after [Current user message] if history was embedded
+    if "[Current user message]" in t:
+        parts = t.split("[Current user message]")
+        recent = parts[0]
+        t = parts[-1].strip()
+    elif "[Recent conversation]" in t:
+        recent = t
+    # strip leading/trailing search phrasing
     t2 = re.sub(
         r"^(search|searhc|serach|google|look\s*up)\s+(the\s+)?(web\s+)?(for\s+)?",
         "", t, flags=re.I,
     ).strip()
+    t2 = re.sub(r"\s*search the web\s*$", "", t2, flags=re.I).strip()
+    t2 = re.sub(r"\?+$", "", t2).strip()
+
+    # Resolve pronouns via last assistant content (e.g. "the book")
+    if recent and re.search(r"\b(the book|this book|that book|it)\b", t2, re.I):
+        # Grab a likely title: quoted text or capitalized multi-word near "Deep Toilet" etc.
+        m = re.search(r"["'“]([^"'”]{4,80})["'”]", recent)
+        if not m:
+            m = re.search(
+                r"\b([A-Z][A-Za-z0-9'’:,\-]+(?:\s+[A-Z0-9][A-Za-z0-9'’:,\-]*){1,8})\b",
+                recent,
+            )
+        if m:
+            title = m.group(1).strip()
+            t2 = f"{title} book summary review"
+
     return t2 or t or "best short bathroom books"
+
+
+def synthesize_web_tool_call(
+    messages: List[dict],
+    tools: Optional[List[dict]] = None,
+    alias_to_real: Optional[Dict[str, str]] = None,
+) -> List[dict]:
+    """
+    When M365 refuses to emit tool JSON for a web ask, invent a proper OpenAI
+    tool_call so Pi still runs web_search / open_page.
+    """
+    if not needs_web_tools(messages):
+        return []
+    preferred_alias = preferred_helper_for(messages, tools)
+    # Map alias -> real tool name Pi understands
+    real = preferred_alias
+    if alias_to_real:
+        real = alias_to_real.get(preferred_alias, preferred_alias)
+        # preferred might already be real
+        if preferred_alias not in alias_to_real and preferred_alias not in set(alias_to_real.values()):
+            # try reverse: if preferred is web_lookup, find real web_search
+            for a, r in alias_to_real.items():
+                if a == preferred_alias or r == preferred_alias:
+                    real = r
+                    break
+    # Prefer real names Pi has
+    for cand in ("web_search", "web_lookup", real, preferred_alias):
+        if cand:
+            real = cand
+            break
+
+    query = suggest_web_query(_latest_user_text(messages))
+    # Match common web tool schemas
+    if real in ("open_page", "fetch_url") or "page" in (real or ""):
+        args = {"url": query if query.startswith("http") else f"https://www.google.com/search?q={query}"}
+    else:
+        args = {"query": query}
+
+    logging = __import__("logging")
+    logging.getLogger(__name__).info(
+        "Synthesizing web tool_call name=%s query=%s", real, query[:80],
+    )
+    return [{
+        "id": f"call_{uuid.uuid4().hex}",
+        "type": "function",
+        "function": {
+            "name": real if real not in (alias_to_real or {}) else alias_to_real.get(real, real),
+            "arguments": json.dumps(args, ensure_ascii=False),
+        },
+    }]
+
+
+def ensure_web_tool_calls(
+    tool_calls: List[dict],
+    messages: List[dict],
+    tools: Optional[List[dict]] = None,
+    alias_to_real: Optional[Dict[str, str]] = None,
+    full_text: str = "",
+) -> List[dict]:
+    """If web was requested and model gave no tool_calls, force one."""
+    if tool_calls:
+        return tool_calls
+    if not needs_web_tools(messages):
+        return []
+    # Always synthesize for web asks — prose 'I'll search' is not a search
+    return synthesize_web_tool_call(messages, tools=tools, alias_to_real=alias_to_real)
 
 
 def suggest_local_command(user_text: str) -> str:
