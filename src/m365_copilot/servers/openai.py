@@ -281,8 +281,9 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
             messages, tools, tool_choice=tool_choice
         )
         logging.info(
-            "chat prepare model=%s msgs=%s tools=%s system_chars=%s",
-            model, meta.get("message_count"), meta.get("tool_count"), meta.get("system_chars"),
+            "chat prepare model=%s msgs=%s tools=%s system_chars=%s force_local=%s",
+            model, meta.get("message_count"), meta.get("tool_count"),
+            meta.get("system_chars"), meta.get("force_local"),
         )
 
         conv_id = self._get_conv_id(req)
@@ -359,64 +360,18 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             async def stream_loop():
+                # Always buffer when tools are present so we can rewrite to
+                # tool_calls or retry without leaking hallucinated prose.
+                buffer_all = has_tools
                 has_content = False
                 full_text = ""
-                buffered = ""
-                buffering = has_tools  # speculative buffer; may flip to live stream
 
-                async for chunk, is_final in client.chat_conversation_stream_gen(
-                    messages, tone, gpt_override, conversation_id=conv_id,
-                    enable_bing=ao.ENABLE_BING,
-                ):
-                    if is_final:
-                        break
-                    chunk = _clean_citations(chunk)
-                    if not chunk:
-                        continue
-                    full_text += chunk
-
-                    if buffering:
-                        buffered += chunk
-                        # If it clearly is not tool JSON, flush and go live
-                        if len(buffered) > 24 and not ao.looks_like_tool_json(buffered):
-                            if not has_content:
-                                self._write_sse(sse_msg(
-                                    {"role": "assistant", "content": buffered},
-                                    chunk_id, openai_model,
-                                ))
-                                has_content = True
-                            else:
-                                self._write_sse(sse_msg(
-                                    {"content": buffered}, chunk_id, openai_model,
-                                ))
-                            buffered = ""
-                            buffering = False
-                        continue
-
-                    if not has_content:
-                        self._write_sse(sse_msg(
-                            {"role": "assistant", "content": chunk}, chunk_id, openai_model,
-                        ))
-                        has_content = True
-                    else:
-                        self._write_sse(sse_msg({"content": chunk}, chunk_id, openai_model))
-
-                # Refusal auto-retry once with softer prompt
-                if (
-                    ao.REFUSAL_RETRY
-                    and ao.is_refusal(full_text)
-                    and not client._last_tool_calls
-                ):
-                    _METRICS["refusals"] += 1
-                    _METRICS["retries"] += 1
-                    logging.info("Refusal detected; retrying with softer prompt")
-                    retry_msgs = ao.refusal_retry_messages(messages)
+                async def _drain(msg_list):
+                    nonlocal full_text, has_content
                     full_text = ""
-                    buffered = ""
                     has_content = False
-                    buffering = has_tools
                     async for chunk, is_final in client.chat_conversation_stream_gen(
-                        retry_msgs, tone, gpt_override, conversation_id=conv_id,
+                        msg_list, tone, gpt_override, conversation_id=conv_id,
                         enable_bing=ao.ENABLE_BING,
                     ):
                         if is_final:
@@ -425,8 +380,7 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                         if not chunk:
                             continue
                         full_text += chunk
-                        if buffering:
-                            buffered += chunk
+                        if buffer_all:
                             continue
                         if not has_content:
                             self._write_sse(sse_msg(
@@ -435,12 +389,57 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                             ))
                             has_content = True
                         else:
-                            self._write_sse(sse_msg({"content": chunk}, chunk_id, openai_model))
+                            self._write_sse(sse_msg(
+                                {"content": chunk}, chunk_id, openai_model,
+                            ))
+
+                await _drain(messages)
 
                 tool_calls, finish_reason = _merge_tool_calls(
                     client._last_tool_calls, full_text,
                     tools=tools, alias_to_real=alias_to_real,
                 )
+
+                # One retry: refusal / hallucination / forced-local without tools
+                if (
+                    ao.REFUSAL_RETRY
+                    and has_tools
+                    and not tool_calls
+                    and not client._last_tool_calls
+                ):
+                    preferred = "run_command"
+                    for t in tools or []:
+                        n = (t.get("function") or t).get("name")
+                        if n in ("run_command", "bash", "read_file", "read"):
+                            preferred = n
+                            break
+                    retry_msgs = None
+                    if ao.is_refusal(full_text):
+                        _METRICS["refusals"] += 1
+                        # Even refusals: try to force a harmless helper path
+                        retry_msgs = ao.force_tool_retry_messages(messages, preferred)
+                        logging.info("Refusal detected; forcing helper retry")
+                    elif ao.is_tool_hallucination(full_text):
+                        _METRICS["refusals"] += 1
+                        retry_msgs = ao.force_tool_retry_messages(messages, preferred)
+                        logging.info(
+                            "Tool hallucination detected; forcing helper retry (%s)",
+                            preferred,
+                        )
+                    elif ao.needs_local_tools(messages):
+                        # Local action requested but model answered in prose
+                        retry_msgs = ao.force_tool_retry_messages(messages, preferred)
+                        logging.info(
+                            "Local action without tools; forcing helper retry (%s)",
+                            preferred,
+                        )
+                    if retry_msgs is not None:
+                        _METRICS["retries"] += 1
+                        await _drain(retry_msgs)
+                        tool_calls, finish_reason = _merge_tool_calls(
+                            client._last_tool_calls, full_text,
+                            tools=tools, alias_to_real=alias_to_real,
+                        )
                 usage = _usage_from(messages, full_text)
 
                 if tool_calls:
@@ -455,13 +454,11 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                     ))
                     return
 
-                # Flush buffered non-tool text
-                if buffering and full_text and not has_content:
+                if buffer_all and full_text:
                     self._write_sse(sse_msg(
                         {"role": "assistant", "content": full_text},
                         chunk_id, openai_model,
                     ))
-                    has_content = True
                 elif not has_content and not full_text:
                     self._write_sse(sse_msg(
                         {"role": "assistant", "content": ""}, chunk_id, openai_model,
@@ -496,17 +493,6 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
                     enable_bing=ao.ENABLE_BING,
                 )
             )
-            if ao.REFUSAL_RETRY and ao.is_refusal(result_text) and not native_tool_calls:
-                _METRICS["refusals"] += 1
-                _METRICS["retries"] += 1
-                logging.info("Refusal detected; retrying with softer prompt")
-                retry_msgs = ao.refusal_retry_messages(messages)
-                result_text, native_tool_calls, finish_reason = _run_async(
-                    client.chat_conversation(
-                        retry_msgs, tone, gpt_override, conversation_id=conv_id,
-                        enable_bing=ao.ENABLE_BING,
-                    )
-                )
         except Exception as e:
             _METRICS["errors"] += 1
             self._send_error(500, str(e))
@@ -516,6 +502,41 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
             native_tool_calls, result_text,
             tools=tools, alias_to_real=alias_to_real,
         )
+
+        if ao.REFUSAL_RETRY and tools and not tool_calls:
+            preferred = "run_command"
+            for t in tools or []:
+                n = (t.get("function") or t).get("name")
+                if n in ("run_command", "bash", "read_file", "read"):
+                    preferred = n
+                    break
+            retry_msgs = None
+            if ao.is_refusal(result_text):
+                _METRICS["refusals"] += 1
+                retry_msgs = ao.force_tool_retry_messages(messages, preferred)
+                logging.info("Refusal detected; forcing helper retry")
+            elif ao.is_tool_hallucination(result_text):
+                _METRICS["refusals"] += 1
+                retry_msgs = ao.force_tool_retry_messages(messages, preferred)
+                logging.info("Tool hallucination detected; forcing helper retry")
+            elif ao.needs_local_tools(messages):
+                retry_msgs = ao.force_tool_retry_messages(messages, preferred)
+                logging.info("Local action without tools; forcing helper retry")
+            if retry_msgs is not None:
+                _METRICS["retries"] += 1
+                try:
+                    result_text, native_tool_calls, finish_reason = _run_async(
+                        client.chat_conversation(
+                            retry_msgs, tone, gpt_override, conversation_id=conv_id,
+                            enable_bing=ao.ENABLE_BING,
+                        )
+                    )
+                    tool_calls, finish_reason = _merge_tool_calls(
+                        native_tool_calls, result_text,
+                        tools=tools, alias_to_real=alias_to_real,
+                    )
+                except Exception as e:
+                    logging.warning("retry failed: %s", e)
 
         msg = {"role": "assistant", "content": result_text if result_text else None}
         if tool_calls:
