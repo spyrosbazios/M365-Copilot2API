@@ -254,6 +254,39 @@ def build_conversation_payload(hex_sid, uuid_sid, messages, tone="Magic", gpt_ov
             chat_messages.append(m)
 
     last_text = _message_text(chat_messages[-1].get("content", "")) if chat_messages else ""
+
+    # If the last user message is a short follow-up and does not already embed
+    # recent conversation, stitch prior turns into last_text (M365 often ignores
+    # messageHistory for pronouns like "pick one" / "that").
+    if chat_messages and len(chat_messages) >= 2 and "[Recent conversation]" not in last_text:
+        prior_bits = []
+        for m in chat_messages[-7:-1]:
+            role = m.get("role", "")
+            content = _message_text(m.get("content", "")).strip()
+            if not content and role == "assistant" and m.get("tool_calls"):
+                names = [
+                    ((tc or {}).get("function") or {}).get("name") or "tool"
+                    for tc in (m.get("tool_calls") or [])
+                ]
+                content = f"[called: {', '.join(names)}]"
+            if not content:
+                continue
+            if len(content) > 900:
+                content = content[:900] + "…"
+            if role == "user":
+                prior_bits.append(f"User: {content}")
+            elif role == "assistant":
+                prior_bits.append(f"Assistant: {content}")
+            elif role == "tool":
+                prior_bits.append(f"Tool({m.get('name') or 'tool'}): {content[:500]}")
+        if prior_bits:
+            last_text = (
+                "[Recent conversation]\n"
+                + "\n".join(prior_bits)
+                + "\n\n[Current user message]\n"
+                + last_text
+            )
+
     if system_parts:
         system_block = "\n\n".join(system_parts)
         last_text = f"[System instructions]\n{system_block}\n\n[User]\n{last_text}" if last_text else system_block
@@ -263,6 +296,7 @@ def build_conversation_payload(hex_sid, uuid_sid, messages, tone="Magic", gpt_ov
         content = _message_text(m.get("content", ""))
 
         if role == "user":
+            # Skip if already folded into last_text as recent conversation
             m365_history.append({
                 "author": "user", "inputMethod": "Keyboard", "text": content or last_text,
                 "messageType": "Chat", "experienceType": "Default",

@@ -135,6 +135,9 @@ CONTEXT_FOLLOWUP_PATTERNS = [
         r"\bas (i|we)\s+(said|asked|mentioned)\b",
         r"\b(continue|pick up|from there|same topic)\b",
         r"\b(descuss|discuss|discused|discussed)\b",
+        r"\b(pick|choose|select)\s+(one|any|something|a book)\b",
+        r"\b(which|what)\s+(one|of those|of these)\b",
+        r"^(yes|no|ok|okay|sure|thanks|the first|the second|this one)\.?$",
     )
 ]
 
@@ -730,6 +733,103 @@ def _tool_choice_forces_tools(tool_choice: Any) -> bool:
     return False
 
 
+def _format_recent_turns(messages: List[dict], max_turns: int = 6, max_chars_each: int = 900) -> str:
+    """Plain-text recent dialogue for embedding into the last user message."""
+    turns = []
+    for m in messages or []:
+        role = m.get("role", "")
+        if role in ("system", "developer"):
+            continue
+        text = _message_text(m.get("content", "")).strip()
+        if not text and role == "assistant" and m.get("tool_calls"):
+            names = []
+            for tc in m.get("tool_calls") or []:
+                fn = (tc or {}).get("function") or {}
+                names.append(fn.get("name") or "tool")
+            text = f"[called: {', '.join(names)}]"
+        if role == "tool":
+            name = m.get("name") or "tool"
+            text = f"[{name}] {text}"
+            role_label = "Tool"
+        elif role == "assistant":
+            role_label = "Assistant"
+        elif role == "user":
+            role_label = "User"
+        else:
+            continue
+        if not text:
+            continue
+        turns.append(f"{role_label}: {_truncate(text, max_chars_each)}")
+    if not turns:
+        return ""
+    # drop the last user turn (current) — caller adds it separately
+    if turns and turns[-1].startswith("User:"):
+        turns = turns[:-1]
+    turns = turns[-max_turns:]
+    return "\n".join(turns)
+
+
+def inject_history_into_last_user(messages: List[dict], max_turns: int = 6) -> List[dict]:
+    """
+    M365 multi-turn is unreliable via messageHistory alone.
+    Embed recent turns into the latest user text so follow-ups like
+    'pick one' still see prior recommendations.
+    """
+    if not messages:
+        return messages
+    msgs = copy.deepcopy(messages)
+
+    # find last user index
+    last_user_i = None
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            last_user_i = i
+            break
+    if last_user_i is None:
+        return msgs
+
+    prior = msgs[: last_user_i + 1]  # include current for formatter strip
+    recent = _format_recent_turns(prior, max_turns=max_turns)
+    if not recent:
+        return msgs
+
+    cur = _message_text(msgs[last_user_i].get("content", "")).strip()
+    # Avoid double-inject
+    if cur.startswith("[Recent conversation]"):
+        return msgs
+
+    short_followup = len(cur) <= 80 or needs_context_followup(msgs)
+    if not short_followup and len(msgs) < 3:
+        return msgs
+
+    # Always inject when there is prior dialogue (M365 loses history otherwise)
+    if last_user_i == 0 and not any(
+        m.get("role") in ("assistant", "tool") for m in msgs[:last_user_i]
+    ):
+        # only system+first user — nothing to inject
+        has_prior = any(m.get("role") in ("assistant", "tool", "user") for m in msgs[:last_user_i])
+        if not has_prior:
+            return msgs
+
+    has_prior = any(m.get("role") in ("assistant", "tool") for m in msgs[:last_user_i])
+    if not has_prior:
+        # still include prior user turns if any
+        has_prior = any(m.get("role") == "user" for m in msgs[:last_user_i])
+    if not has_prior:
+        return msgs
+
+    bundled = (
+        "[Recent conversation]\n"
+        f"{recent}\n\n"
+        "[Current user message]\n"
+        f"{cur}\n"
+        "\n(Use the recent conversation for pronouns and short replies like "
+        "'pick one', 'which', 'that one'.)"
+    )
+    _set_message_text(msgs[last_user_i], bundled)
+    return msgs
+
+
 def prepare_chat_request(
     messages: List[dict],
     tools: Optional[List[dict]],
@@ -750,6 +850,9 @@ def prepare_chat_request(
         or _tool_choice_forces_tools(tool_choice)
     )
     keep_context = needs_context_followup(messages)
+
+    # Embed history into last user message (M365 forgets multi-turn otherwise)
+    messages = inject_history_into_last_user(messages, max_turns=8 if keep_context else 6)
 
     if wants_tools:
         compressed = compress_messages(
