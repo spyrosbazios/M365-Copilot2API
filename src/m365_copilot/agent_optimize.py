@@ -387,15 +387,16 @@ def _scope_tools(tools: List[dict], messages: Optional[List[dict]] = None) -> Li
             "eza", "ls", "git", "command", "file", "path",
         ))
 
-    if web and not local:
+    # Prefer pure web tool set when the ask is research-shaped ("search" also
+    # matches local patterns, which would otherwise pull in bash/read/etc.).
+    if web:
         scoped = [t for t in tools if is_web(name_of(t))]
-        return scoped or tools[:MAX_TOOLS]
-    if local and not web:
+        if scoped:
+            return scoped[:MAX_TOOLS]
+    if local:
         scoped = [t for t in tools if is_local(name_of(t))]
-        return scoped or tools[:MAX_TOOLS]
-    if web and local:
-        scoped = [t for t in tools if is_web(name_of(t)) or is_local(name_of(t))]
-        return scoped or tools[:MAX_TOOLS]
+        if scoped:
+            return scoped[:MAX_TOOLS]
     return tools
 
 
