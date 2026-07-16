@@ -503,9 +503,20 @@ class OpenAIHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             _METRICS["errors"] += 1
             logging.exception("stream chat failed")
+            # Drop dead client so next request rebuilds WS cleanly
+            try:
+                client._invalidate_ws()
+            except Exception:
+                pass
+            msg = str(e)
+            if "handshake" in msg.lower() or "timeout" in msg.lower():
+                msg = (
+                    f"{msg}. Connection to M365 timed out — retry your message. "
+                    "If this keeps happening, run: systemctl --user restart m365-copilot-server"
+                )
             err = {"id": chunk_id, "object": "chat.completion.chunk",
                    "created": int(time.time()), "model": openai_model,
-                   "choices": [{"index": 0, "delta": {"content": f"Error: {e}"}, "finish_reason": "stop"}]}
+                   "choices": [{"index": 0, "delta": {"content": f"Error: {msg}"}, "finish_reason": "stop"}]}
             self._write_sse(f"data: {json.dumps(err)}\n\n")
             self._write_sse("data: [DONE]\n\n")
 

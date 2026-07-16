@@ -52,11 +52,14 @@ def _signalr_handshake(ws):
 
 
 class M365Client:
-    def __init__(self, token_manager: TokenManager, timeout_handshake=15, timeout_recv=45, timeout_recv_final=60):
+    def __init__(self, token_manager: TokenManager, timeout_handshake=20, timeout_recv=45, timeout_recv_final=90,
+                 open_timeout=30, connect_retries=3):
         self.token_manager = token_manager
         self.timeout_handshake = timeout_handshake
         self.timeout_recv = timeout_recv
         self.timeout_recv_final = timeout_recv_final
+        self.open_timeout = open_timeout
+        self.connect_retries = connect_retries
         self._ws = None
         self._ws_token = None
         self._ws_url = None
@@ -85,12 +88,56 @@ class M365Client:
     def _mark_dirty(self):
         self._ws_dirty = True
 
+    def _ws_looks_open(self):
+        ws = self._ws
+        if ws is None:
+            return False
+        try:
+            # websockets v12+ uses .state / protocol; close_code set when closed
+            if getattr(ws, "close_code", None) is not None:
+                return False
+            state = getattr(ws, "state", None)
+            if state is not None and str(state).endswith("OPEN") is False and "OPEN" not in str(state):
+                # State.OPEN name varies; treat non-open conservatively
+                name = getattr(state, "name", str(state))
+                if name not in ("OPEN", "State.OPEN"):
+                    return False
+        except Exception:
+            return False
+        return True
+
+    async def _connect_ws(self, url):
+        last_err = None
+        for attempt in range(1, self.connect_retries + 1):
+            try:
+                ws = await websockets.connect(
+                    url,
+                    max_size=50 * 1024 * 1024,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    open_timeout=self.open_timeout,
+                )
+                await _signalr_handshake(ws)
+                await asyncio.wait_for(ws.recv(), timeout=self.timeout_handshake)
+                return ws
+            except Exception as e:
+                last_err = e
+                try:
+                    if "ws" in locals() and ws is not None:
+                        await ws.close()
+                except Exception:
+                    pass
+                # brief backoff then retry (common after tool-round idle)
+                await asyncio.sleep(min(0.4 * attempt, 1.5))
+        raise last_err if last_err else TimeoutError("websocket connect failed")
+
     async def _ensure_ws(self, conversation_id=None, hex_sid=None):
         token = self.token_manager.get()
         url, hex_sid, uuid_sid = build_url(token, hex_sid=hex_sid, conversation_id=conversation_id)
 
         ws_alive = (
-            self._ws is not None
+            self._ws_looks_open()
             and not self._ws_dirty
             and self._ws_token == token
             and self._ws_url == url
@@ -101,11 +148,8 @@ class M365Client:
                     await self._ws.close()
                 except Exception:
                     pass
-            self._ws = await websockets.connect(
-                url, max_size=50 * 1024 * 1024, ping_interval=None, close_timeout=10
-            )
-            await _signalr_handshake(self._ws)
-            await asyncio.wait_for(self._ws.recv(), timeout=self.timeout_handshake)
+                self._invalidate_ws()
+            self._ws = await self._connect_ws(url)
             self._ws_token = token
             self._ws_url = url
             self._ws_dirty = False
@@ -179,13 +223,21 @@ class M365Client:
     async def chat_conversation_stream_gen(self, messages, tone="Magic", gpt_override=None, conversation_id=None,
                                           enable_image_gen=False, extra_options=None, hex_sid=None,
                                           enable_bing=None):
-        ws, hex_sid, uuid_sid = await self._ensure_ws(conversation_id, hex_sid=hex_sid)
-        payload = build_conversation_payload(
-            hex_sid, uuid_sid, messages, tone, gpt_override,
-            enable_image_gen=enable_image_gen, extra_options=extra_options,
-            enable_bing=enable_bing,
-        )
-        await ws.send(payload + "\x1e")
+        # One automatic reconnect if send fails on a half-dead socket
+        for attempt in range(2):
+            try:
+                ws, hex_sid, uuid_sid = await self._ensure_ws(conversation_id, hex_sid=hex_sid)
+                payload = build_conversation_payload(
+                    hex_sid, uuid_sid, messages, tone, gpt_override,
+                    enable_image_gen=enable_image_gen, extra_options=extra_options,
+                    enable_bing=enable_bing,
+                )
+                await ws.send(payload + "\x1e")
+                break
+            except Exception:
+                self._invalidate_ws()
+                if attempt == 1:
+                    raise
 
         tool_calls = []
         self._last_tool_calls = []
