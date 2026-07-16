@@ -133,26 +133,60 @@ def is_tool_hallucination(text: str) -> bool:
     return hits >= 1
 
 
-def needs_local_tools(messages: List[dict]) -> bool:
-    """Heuristic: latest user turn wants machine/file actions."""
+def _latest_user_text(messages: List[dict]) -> str:
     for m in reversed(messages or []):
         if m.get("role") != "user":
             continue
         text = _message_text(m.get("content"))
         if not text:
-            return False
-        # Ignore our injected helper prompt prefix if present
-        if "Helpers:" in text and "When calling a helper" in text:
-            # take last [User] section if folded
-            if "[User]" in text:
-                text = text.split("[User]")[-1]
-            else:
-                # strip leading helper block roughly
-                idx = text.rfind("\n\n")
-                if idx > 0:
-                    text = text[idx:]
-        return any(p.search(text) for p in LOCAL_ACTION_PATTERNS)
-    return False
+            return ""
+        if "[User]" in text:
+            text = text.split("[User]")[-1]
+        # Drop injected helper blocks if present
+        if "Helpers:" in text and "LOCAL MACHINE RULES" in text:
+            parts = re.split(r"\n(?=[A-Za-z0-9_/~])", text)
+            # keep last chunk that looks like the real user ask
+            for part in reversed(parts):
+                if "Helpers:" not in part and "LOCAL MACHINE" not in part and part.strip():
+                    return part.strip()
+        return text.strip()
+    return ""
+
+
+def needs_local_tools(messages: List[dict]) -> bool:
+    """Heuristic: latest user turn wants machine/file actions."""
+    text = _latest_user_text(messages)
+    if not text:
+        return False
+    return any(p.search(text) for p in LOCAL_ACTION_PATTERNS)
+
+
+def suggest_local_command(user_text: str) -> str:
+    """Best-effort shell command for common agent asks (used only as JSON example)."""
+    t = (user_text or "").lower()
+    if any(w in t for w in ("dotfile", "dotfiles", "stow")):
+        return "ls -la ~/dotfiles && ls -la ~/.config | head -50"
+    if ".config" in t or "config dirs" in t or "configs" in t:
+        return "ls -la ~/.config"
+    if any(w in t for w in ("git status", "branch", "commit")):
+        return "git -C ~/dotfiles status -sb && git -C ~/dotfiles branch --show-current"
+    if any(w in t for w in ("disk", "df ", "free space")):
+        return "df -h / /home 2>/dev/null; du -sh ~/dotfiles ~/.config 2>/dev/null"
+    if any(w in t for w in ("process", "cpu", "memory", "ram")):
+        return "ps aux --sort=-%mem | head -15"
+    if any(w in t for w in ("python", "venv", "pip")):
+        return "which python; python --version; ls -la .venv 2>/dev/null | head"
+    if any(w in t for w in ("pi agent", "pi config", "models.json")):
+        return "ls -la ~/.pi/agent && sed -n '1,80p' ~/.pi/agent/models.json"
+    if any(w in t for w in ("nvim", "neovim", "vim")):
+        return "ls -la ~/.config/nvim 2>/dev/null; ls -la ~/dotfiles/nvim 2>/dev/null"
+    if any(w in t for w in ("zsh", "shell")):
+        return "ls -la ~/dotfiles/zsh ~/.config/zsh 2>/dev/null; echo SHELL=$SHELL"
+    if re.search(r"\bread\b|\bopen\b|\bshow\b|\bcat\b", t) and re.search(r"\.[a-z0-9]+", t):
+        return "ls -la"
+    if any(w in t for w in ("list", "show", "ls", "what is in", "what's in")):
+        return "ls -la"
+    return "ls -la"
 
 
 def _message_text(content: Any) -> str:
@@ -351,10 +385,19 @@ def compress_messages(messages: List[dict]) -> List[dict]:
     return out
 
 
-def build_tools_prompt(tools: List[dict], tool_choice: Any = None, force_local: bool = False) -> str:
+def build_tools_prompt(
+    tools: List[dict],
+    tool_choice: Any = None,
+    force_local: bool = False,
+    user_text: str = "",
+) -> str:
     tools_json = []
     for t in tools:
+        if not isinstance(t, dict):
+            continue
         fn = t.get("function", t)
+        if not isinstance(fn, dict):
+            continue
         tools_json.append({
             "name": fn.get("name"),
             "description": fn.get("description", ""),
@@ -366,12 +409,10 @@ def build_tools_prompt(tools: List[dict], tool_choice: Any = None, force_local: 
     if tool_choice == "required":
         force = True
     elif isinstance(tool_choice, dict):
-        # {"type":"function","function":{"name":"..."}}
         fn = tool_choice.get("function") or {}
         force_name = fn.get("name")
         force = bool(force_name) or force
 
-    # Prefer shell-like helpers first in the hint when forcing local actions
     preferred = None
     for cand in ("run_command", "bash", "read_file", "read", "search_text", "eza"):
         if any(t.get("name") == cand for t in tools_json):
@@ -391,6 +432,15 @@ def build_tools_prompt(tools: List[dict], tool_choice: Any = None, force_local: 
             f"This request needs a helper{hint}. "
             "Output ONLY the helper JSON now — no explanation."
         )
+        if preferred in ("run_command", "bash"):
+            cmd = suggest_local_command(user_text or "")
+            lines.append(
+                "Example shape only: "
+                + json.dumps(
+                    {"name": preferred, "arguments": {"command": cmd}},
+                    ensure_ascii=False,
+                )
+            )
     else:
         lines.append("If no helper is needed, answer in plain text.")
     lines.append("")
@@ -405,7 +455,13 @@ def inject_tools_prompt(
 ) -> None:
     if not tools or not messages:
         return
-    prompt = build_tools_prompt(tools, tool_choice=tool_choice, force_local=force_local)
+    user_text = _latest_user_text(messages)
+    prompt = build_tools_prompt(
+        tools,
+        tool_choice=tool_choice,
+        force_local=force_local,
+        user_text=user_text,
+    )
     for m in reversed(messages):
         if m.get("role") == "user":
             text = _message_text(m.get("content"))
@@ -433,14 +489,31 @@ def refusal_retry_messages(messages: List[dict]) -> List[dict]:
 def force_tool_retry_messages(messages: List[dict], preferred_helper: str = "run_command") -> List[dict]:
     """Retry when the model hallucinated instead of calling tools."""
     msgs = copy.deepcopy(messages)
+    # Keep example mild — aggressive shell/path wording triggers M365 blocks.
+    if preferred_helper in ("run_command", "bash"):
+        cmd = suggest_local_command(_latest_user_text(messages))
+        example = json.dumps(
+            {"name": preferred_helper, "arguments": {"command": cmd}},
+            ensure_ascii=False,
+        )
+    elif preferred_helper in ("read_file", "read"):
+        example = (
+            f'{{"name":"{preferred_helper}",'
+            '"arguments":{"path":"."}}'
+        )
+    else:
+        example = f'{{"name":"{preferred_helper}","arguments":{{}}}}'
+
     soft = (
-        "\n\n[Retry] You must not invent files or claim lack of access. "
-        f"Call a helper now (prefer {preferred_helper}) with ONLY JSON, e.g.\n"
-        f'{{"name":"{preferred_helper}","arguments":{{"command":"ls -la ~"}}}}\n'
+        "\n\n[Retry] Do not invent results. "
+        "Output ONLY one helper JSON object now (no markdown, no apology), e.g.\n"
+        f"{example}\n"
     )
     for m in reversed(msgs):
         if m.get("role") == "user":
             text = _message_text(m.get("content"))
+            # Strip earlier harsh retry blocks to avoid stacking filters
+            text = re.sub(r"\n\n\[Retry\].*$", "", text, flags=re.S)
             _set_message_text(m, text + soft)
             break
     return msgs
